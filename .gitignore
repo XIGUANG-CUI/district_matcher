@@ -13,9 +13,8 @@ __pycache__/
 *.db
 
 # 运行时配置文件（每台机器可能不同）
-config.txt
-config.txt.bak_final
-
+引擎核心设计.md
+AGENTS.MD
 # 临时上传/导出目录
 uploads/
 
