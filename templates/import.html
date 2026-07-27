@@ -1,0 +1,225 @@
+{% extends "base.html" %}
+{% block title %}学生数据导入{% endblock %}
+{% block content %}
+<h3>学生数据导入</h3>
+<p class="text-muted">支持 .xlsx / .csv。系统自动识别“姓名/身份证号/地址”列。</p>
+
+<div class="alert alert-info py-2">
+    首次使用请先
+    <a href="{{ url_for('template_student') }}" class="alert-link">下载学生导入模板</a>，
+    按表头（姓名 / 身份证号 / 地址）填写后上传。
+</div>
+
+<div id="import-progress" class="card mb-3" style="display:none;">
+    <div class="card-body py-2">
+        <div class="d-flex justify-content-between small mb-1">
+            <span id="imp-phase">正在导入…</span>
+            <span id="imp-text">0 / 0</span>
+        </div>
+        <div class="progress" style="height:18px;">
+            <div id="imp-bar" class="progress-bar progress-bar-striped progress-bar-animated"
+                 role="progressbar" style="width:0%"></div>
+        </div>
+        <div id="imp-detail" class="small text-muted mt-1"></div>
+    </div>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <form method="post" enctype="multipart/form-data">
+            <input type="file" name="file" class="form-control mb-2" accept=".xlsx,.csv">
+            <div class="row g-2 mb-2">
+                <div class="col">
+                    <input type="text" name="col_id_card" class="form-control"
+                           placeholder="身份证号列名（留空自动识别）">
+                </div>
+                <div class="col">
+                    <input type="text" name="col_address" class="form-control"
+                           placeholder="地址列名（留空自动识别）">
+                </div>
+                <div class="col">
+                    <input type="text" name="col_name" class="form-control"
+                           placeholder="姓名列名（留空自动识别）">
+                </div>
+            </div>
+            <button type="button" class="btn btn-primary" id="btn-import">导入</button>
+            <button type="button" class="btn btn-outline-primary" id="btn-preview">预览前10行</button>
+            <a href="{{ url_for('template_student') }}" class="btn btn-outline-secondary">下载模板</a>
+        </form>
+        <div id="preview-area" class="mt-3"></div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <h5 class="card-title">历史批次</h5>
+        <table class="table table-sm">
+            <thead><tr><th>批次号</th><th>人数</th><th>导入时间</th><th>操作</th></tr></thead>
+            <tbody>
+            {% for b in batches %}
+                <tr>
+                    <td>{{ b.batch_id }}</td><td>{{ b.cnt }}</td><td>{{ b.last }}</td>
+                    <td><a class="btn btn-sm btn-outline-primary"
+                           href="{{ url_for('result_page', batch_id=b.batch_id) }}">去处理</a></td>
+                </tr>
+            {% else %}
+                <tr><td colspan="4">暂无批次</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card mt-3">
+    <div class="card-body">
+        <h6 class="card-title">操作日志</h6>
+        {% if oplog %}
+        <ul class="small mb-0 ps-3">
+            {% for e in oplog %}<li>[{{ e.t }}] {{ e.msg }}</li>{% endfor %}
+        </ul>
+        {% else %}
+        <p class="small text-muted mb-0">暂无操作记录。</p>
+        {% endif %}
+    </div>
+</div>
+
+<script>
+// D3：导入预览（前10行）→ 确认后导入；导入中按钮反馈
+(function () {
+    var form = document.querySelector('form[enctype="multipart/form-data"]');
+    var previewBtn = document.getElementById('btn-preview');
+    var importBtn = document.getElementById('btn-import');
+    var area = document.getElementById('preview-area');
+
+    if (previewBtn && form) {
+        previewBtn.addEventListener('click', function () {
+            var fd = new FormData(form);
+            area.innerHTML = '<div class="text-muted small">正在读取预览…</div>';
+            fetch('{{ url_for("import_preview") }}', {method: 'POST', body: fd})
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    if (!d.ok) {
+                        area.innerHTML = '<div class="alert alert-warning py-2">' + d.msg + '</div>';
+                        return;
+                    }
+                    var html = '<div class="alert alert-success py-2">自动识别列：'
+                        + '身份证号→<b>' + (d.detected.id_card || '未识别') + '</b>，'
+                        + '地址→<b>' + (d.detected.address || '未识别') + '</b>，'
+                        + '姓名→<b>' + (d.detected.name || '未识别') + '</b></div>';
+                    html += '<p class="small text-muted mb-1">预览前 ' + d.rows.length
+                        + ' 行（共 ' + d.columns.length + ' 列）：</p>';
+                    html += '<div class="table-responsive"><table class="table table-sm table-bordered">';
+                    html += '<thead><tr>';
+                    d.columns.forEach(function (c) { html += '<th>' + c + '</th>'; });
+                    html += '</tr></thead><tbody>';
+                    d.rows.forEach(function (row) {
+                        html += '<tr>';
+                        d.columns.forEach(function (c) {
+                            var v = row[c];
+                            html += '<td>' + (v === null || v === undefined ? '' : v) + '</td>';
+                        });
+                        html += '</tr>';
+                    });
+                    html += '</tbody></table></div>';
+                    html += '<p class="small text-muted">确认无误后点击上方“导入”按钮完成导入。</p>';
+                    area.innerHTML = html;
+                })
+                .catch(function () {
+                    area.innerHTML = '<div class="alert alert-danger py-2">预览出错</div>';
+                });
+        });
+    }
+
+    if (importBtn && form) {
+        importBtn.addEventListener('click', function () {
+            var fileInput = form.querySelector('input[name="file"]');
+            if (!fileInput || !fileInput.files.length) {
+                alert('请选择学生数据文件（.xlsx / .csv）。');
+                return;
+            }
+            var fd = new FormData(form);
+            fd.append('kind', 'student');
+            importBtn.disabled = true;
+            importBtn.textContent = '导入中…';
+            startImportProgress(fd, importBtn);
+        });
+    }
+
+    function startImportProgress(fd, btn) {
+        var panel = document.getElementById('import-progress');
+        var bar = document.getElementById('imp-bar');
+        var txt = document.getElementById('imp-text');
+        var phase = document.getElementById('imp-phase');
+        var detail = document.getElementById('imp-detail');
+        panel.style.display = 'block';
+        bar.style.width = '0%';
+        bar.className = 'progress-bar progress-bar-striped progress-bar-animated';
+        txt.textContent = '0 / 0';
+        phase.textContent = '正在导入…';
+        detail.textContent = '';
+        fetch('{{ url_for("api_import_start") }}', {method: 'POST', body: fd})
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d.ok) {
+                    alert(d.msg || '启动失败');
+                    if (btn) { btn.disabled = false; btn.textContent = '导入'; }
+                    panel.style.display = 'none';
+                    return;
+                }
+                poll(d.task_id, btn);
+            })
+            .catch(function () {
+                if (btn) { btn.disabled = false; btn.textContent = '导入'; }
+                panel.style.display = 'none';
+            });
+    }
+
+    function poll(taskId, btn) {
+        var bar = document.getElementById('imp-bar');
+        var txt = document.getElementById('imp-text');
+        var phase = document.getElementById('imp-phase');
+        var detail = document.getElementById('imp-detail');
+        fetch('{{ url_for("api_import_progress") }}?task_id=' + encodeURIComponent(taskId))
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d.status === 'running' || d.status === 'idle') {
+                    var pct = d.total ? Math.round(d.done / d.total * 100) : 0;
+                    bar.style.width = pct + '%';
+                    txt.textContent = d.done + ' / ' + d.total + (pct ? '（' + pct + '%）' : '');
+                    phase.textContent = (d.phase === 'writing') ? '正在写入数据库…'
+                        : (d.phase === 'building' ? '正在解析数据…' : '正在导入…');
+                    detail.textContent = d.detail || '';
+                    setTimeout(function () { poll(taskId, btn); }, 500);
+                } else if (d.status === 'done') {
+                    bar.style.width = '100%';
+                    phase.textContent = '导入完成';
+                    txt.textContent = '';
+                    detail.textContent = d.detail || '';
+                    try { sessionStorage.setItem('importMsg', '学生数据导入成功：' + (d.detail || '')); } catch (e) {}
+                    setTimeout(function () { location.reload(); }, 1200);
+                } else if (d.status === 'error') {
+                    bar.className = 'progress-bar bg-danger';
+                    bar.style.width = '100%';
+                    phase.textContent = '导入失败';
+                    detail.textContent = d.error || '';
+                    if (btn) { btn.disabled = false; btn.textContent = '导入'; }
+                }
+            })
+            .catch(function () { setTimeout(function () { poll(taskId, btn); }, 1500); });
+    }
+
+    // 刷新后展示上一次导入结果（跨页面重载保留提示）
+    try {
+        var msg = sessionStorage.getItem('importMsg');
+        if (msg) {
+            sessionStorage.removeItem('importMsg');
+            var box = document.createElement('div');
+            box.className = 'alert alert-success alert-dismissible fade show';
+            box.innerHTML = msg + '<button type="button" class="btn-close" data-bs-dismiss="alert"></button>';
+            var c = document.querySelector('.container');
+            if (c) { c.insertBefore(box, c.firstChild); }
+        }
+    } catch (e) {}
+})();
+</script>
+{% endblock %}

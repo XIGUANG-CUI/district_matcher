@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block title %}数据初始化{% endblock %}
+{% block content %}
+<h3>数据初始化</h3>
+<p class="text-muted">导入“当前行政区划代码映射表”（Excel）。默认读取
+    <code>data/</code> 下的 Excel。</p>
+
+<div id="import-progress" class="card mb-3" style="display:none;">
+    <div class="card-body py-2">
+        <div class="d-flex justify-content-between small mb-1">
+            <span id="imp-phase">正在导入…</span>
+            <span id="imp-text">0 / 0</span>
+        </div>
+        <div class="progress" style="height:18px;">
+            <div id="imp-bar" class="progress-bar progress-bar-striped progress-bar-animated"
+                 role="progressbar" style="width:0%"></div>
+        </div>
+        <div id="imp-detail" class="small text-muted mt-1"></div>
+    </div>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <h5 class="card-title">通过 data 目录导入</h5>
+        {% if default_excel %}
+            <p>检测到：<code>{{ default_excel }}</code></p>
+            <button id="btn-import-default" class="btn btn-success">导入默认目录数据</button>
+        {% else %}
+            <p class="text-warning">未检测到 data 目录下的 Excel，请将
+                <code>全国行政编码数据.xlsx</code> 复制到项目 data/ 目录。</p>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <h5 class="card-title">上传 Excel 导入</h5>
+        <p class="text-muted small">标准列结构：ID / PIDS / PID / 行政区域代码 / 城乡分类代码 / 行政区域名称 / 行政层级。</p>
+        <form id="form-upload-district" enctype="multipart/form-data">
+            <input type="file" name="file" class="form-control mb-2" accept=".xlsx">
+            <button type="submit" class="btn btn-primary">上传并导入</button>
+            <a href="{{ url_for('template_district') }}" class="btn btn-outline-secondary">下载模板</a>
+        </form>
+    </div>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <h5 class="card-title">数据库状态</h5>
+        <p>当前区划记录总数：<strong>{{ total }}</strong></p>
+        <table class="table table-sm">
+            <thead><tr><th>层级</th><th>名称</th><th>记录数</th></tr></thead>
+            <tbody>
+            {% for lvl, cnt in stats.items() %}
+                <tr><td>{{ lvl }}</td><td>{{ admin_level_name.get(lvl, '-') }}</td>
+                    <td>{{ cnt }}</td></tr>
+            {% else %}
+                <tr><td colspan="3">暂无数据</td></tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        <form method="post" onsubmit="return confirm('确认清空全部数据？');">
+            <button name="action" value="reset" class="btn btn-outline-danger btn-sm">清空/重置数据库</button>
+        </form>
+    </div>
+</div>
+
+<script>
+(function () {
+    var panel = document.getElementById('import-progress');
+    var bar = document.getElementById('imp-bar');
+    var txt = document.getElementById('imp-text');
+    var phase = document.getElementById('imp-phase');
+    var detail = document.getElementById('imp-detail');
+
+    function startImport(formData, btn) {
+        if (btn) { btn.disabled = true; btn.dataset.old = btn.textContent; btn.textContent = '导入中…'; }
+        panel.style.display = 'block';
+        bar.style.width = '0%';
+        bar.className = 'progress-bar progress-bar-striped progress-bar-animated';
+        txt.textContent = '0 / 0';
+        phase.textContent = '正在导入…';
+        detail.textContent = '';
+        fetch('{{ url_for("api_import_start") }}', {method: 'POST', body: formData})
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (!d.ok) {
+                    alert(d.msg || '启动失败');
+                    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.old; }
+                    panel.style.display = 'none';
+                    return;
+                }
+                poll(d.task_id, btn);
+            })
+            .catch(function () {
+                if (btn) { btn.disabled = false; btn.textContent = btn.dataset.old; }
+                panel.style.display = 'none';
+            });
+    }
+
+    function poll(taskId, btn) {
+        fetch('{{ url_for("api_import_progress") }}?task_id=' + encodeURIComponent(taskId))
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (d.status === 'running' || d.status === 'idle') {
+                    var pct = d.total ? Math.round(d.done / d.total * 100) : 0;
+                    bar.style.width = pct + '%';
+                    txt.textContent = d.done + ' / ' + d.total + (pct ? '（' + pct + '%）' : '');
+                    phase.textContent = (d.phase === 'writing') ? '正在写入数据库…' : '正在读取数据表…';
+                    detail.textContent = d.detail || '';
+                    setTimeout(function () { poll(taskId, btn); }, 500);
+                } else if (d.status === 'done') {
+                    bar.style.width = '100%';
+                    phase.textContent = '导入完成';
+                    txt.textContent = '';
+                    detail.textContent = d.detail || '';
+                    try { sessionStorage.setItem('initMsg', '导入完成：' + (d.detail || '')); } catch (e) {}
+                    setTimeout(function () { location.reload(); }, 1200);
+                } else if (d.status === 'error') {
+                    bar.className = 'progress-bar bg-danger';
+                    bar.style.width = '100%';
+                    phase.textContent = '导入失败';
+                    detail.textContent = d.error || '';
+                    if (btn) { btn.disabled = false; btn.textContent = btn.dataset.old; }
+                }
+            })
+            .catch(function () { setTimeout(function () { poll(taskId, btn); }, 1500); });
+    }
+
+    var defBtn = document.getElementById('btn-import-default');
+    if (defBtn) {
+        defBtn.addEventListener('click', function () {
+            var fd = new FormData();
+            fd.append('kind', 'district');
+            fd.append('action', 'import_default');
+            startImport(fd, defBtn);
+        });
+    }
+    var upForm = document.getElementById('form-upload-district');
+    if (upForm) {
+        upForm.addEventListener('submit', function (e) {
+            e.preventDefault();
+            var fd = new FormData(upForm);
+            fd.append('kind', 'district');
+            fd.append('action', 'upload');
+            startImport(fd, upForm.querySelector('button[type=submit]'));
+        });
+    }
+
+    // 刷新后展示上一次导入结果（跨页面重载保留提示）
+    try {
+        var msg = sessionStorage.getItem('initMsg');
+        if (msg) {
+            sessionStorage.removeItem('initMsg');
+            var box = document.createElement('div');
+            box.className = 'alert alert-success alert-dismissible fade show';
+            box.innerHTML = msg + '<button type="button" class="btn-close" data-bs-dismiss="alert"></button>';
+            var c = document.querySelector('.container');
+            if (c) { c.insertBefore(box, c.firstChild); }
+        }
+    } catch (e) {}
+})();
+</script>
+{% endblock %}

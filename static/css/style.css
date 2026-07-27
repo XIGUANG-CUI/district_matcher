@@ -1,0 +1,4 @@
+/* 基础样式 */
+body { font-family: "Microsoft YaHei", system-ui, sans-serif; }
+pre { white-space: pre-wrap; word-break: break-all; }
+.table th { white-space: nowrap; }

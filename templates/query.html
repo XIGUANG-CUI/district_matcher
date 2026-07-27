@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}单条查询{% endblock %}
+{% block content %}
+<h3>单条查询</h3>
+<form method="post" class="mb-3">
+    <div class="mb-2">
+        <label class="form-label">身份证号</label>
+        <input type="text" name="id_card" class="form-control" maxlength="18"
+               placeholder="如 23010519890714291X">
+    </div>
+    <div class="mb-2">
+        <label class="form-label">地址</label>
+        <input type="text" name="address" class="form-control"
+               placeholder="如 哈尔滨市道外区水泥路99-4号">
+    </div>
+    <button class="btn btn-primary">查询</button>
+</form>
+
+{% if result %}
+<div class="card">
+    <div class="card-body">
+        <h5 class="card-title">匹配结果
+            <span class="badge bg-info">{{ result.match_status }}</span></h5>
+        <table class="table table-sm">
+            <tr><th>省级</th><td>{{ result.province_name }}（{{ result.province_code }}）</td></tr>
+            <tr><th>市级</th><td>{{ result.city_name }}（{{ result.city_code }}）</td></tr>
+            <tr><th>区县级</th><td>{{ result.district_name }}（{{ result.district_code }}）</td></tr>
+        </table>
+        <h6>引擎①过程</h6><pre class="small">{{ result.engine1_detail }}</pre>
+        <h6>引擎②过程</h6><pre class="small">{{ result.engine2_detail }}</pre>
+        <h6>决策路径</h6><p class="small">{{ result.decision_path }}</p>
+    </div>
+</div>
+{% endif %}
+{% endblock %}
