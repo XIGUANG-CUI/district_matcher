@@ -1,16 +1,25 @@
 """配置文件：路径与全局常量。"""
 import os
+import sys
 
-# 项目根目录（district_matcher/）
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 项目根目录
+# PyInstaller 打包后（sys.frozen == True）：
+#   BASE_DIR  = exe 所在目录（可写：数据库 / uploads / config.txt）
+#   BUNDLE_DIR = _MEIPASS 临时解压目录（只读：模板 / 静态文件 / 区划源数据）
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+    BUNDLE_DIR = sys._MEIPASS
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    BUNDLE_DIR = BASE_DIR
 
-# 数据库文件
+# 数据库文件（可写，exe 同级 database/ 目录）
 DB_PATH = os.path.join(BASE_DIR, "database", "district_matcher.db")
 
-# 数据目录（用于存放待导入的 Excel，如“全国行政编码数据.xlsx”）
-DATA_DIR = os.path.join(BASE_DIR, "data")
+# 数据目录（只读，打包的 Excel 源数据）
+DATA_DIR = os.path.join(BUNDLE_DIR, "data")
 
-# 上传临时目录
+# 上传临时目录（可写，exe 同级 uploads/ 目录）
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 

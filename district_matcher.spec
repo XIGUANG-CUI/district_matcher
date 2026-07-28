@@ -74,7 +74,12 @@ for icon_name in ['favicon.ico', 'favicon.png', 'icon.ico', 'icon.png']:
     if os.path.exists(icon_path):
         datas.append((icon_path, '.'))
 
-# 5. openpyxl 的隐式依赖数据（Excel 读写需要）
+# 5. 运行配置文件（用户可修改 PORT / TRAY / OPEN_BROWSER）
+config_path = os.path.join(base_path, 'config.txt')
+if os.path.exists(config_path):
+    datas.append((config_path, '.'))
+
+# 6. openpyxl 的隐式依赖数据（Excel 读写需要）
 datas += collect_data_files('openpyxl')
 
 # ====================== 隐藏导入（防止分析遗漏） ======================
@@ -219,7 +224,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name=exe_name,
-    debug=False,
+    debug=True,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
@@ -232,6 +237,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=os.path.join(base_path, 'favicon.ico'),
 )
 
 # ====================== COLLECT 目录输出 ======================

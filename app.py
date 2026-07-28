@@ -16,7 +16,18 @@ import pandas as pd
 from database.db_manager import DBManager
 from services import import_service, match_service, export_service
 
-app = Flask(__name__)
+# PyInstaller 打包后（sys.frozen == True）须显式指定模板与静态文件路径
+# 因为 Flask 根据 __main__ 模块推导的 root_path 在冻结模式下不正确
+if getattr(sys, 'frozen', False):
+    # console=False 时 PyInstaller 使用 runw.exe（GUI 子系统），
+    # sys.stdout / sys.stderr 为 None，Flask/click 打印横幅时会崩溃
+    sys.stdout = open(os.devnull, 'w')
+    sys.stderr = open(os.devnull, 'w')
+    app = Flask(__name__,
+                template_folder=os.path.join(sys._MEIPASS, 'templates'),
+                static_folder=os.path.join(sys._MEIPASS, 'static'))
+else:
+    app = Flask(__name__)
 app.secret_key = "district_matcher_secret"
 db = DBManager()
 
@@ -425,17 +436,28 @@ _config_cache = None
 
 
 def _read_config_file():
-    """读取同级 config.txt，返回 {大写键: 值} 字典。出错返回空字典。
+    """读取 exe 同级 config.txt，返回 {大写键: 值} 字典。出错返回空字典。
 
     模块级缓存：config.txt 为静态配置，进程内只解析一次，避免 load_port /
     _flag_on 每次重复读文件（P13）。
+
+    PyInstaller 打包后 config.txt 应放在 exe 同级目录，方便用户编辑端口/托盘配置。
     """
     global _config_cache
     if _config_cache is not None:
         return _config_cache
     data = {}
     try:
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.txt")
+        # 冻结模式下从 exe 同级目录读取，非冻结模式从脚本目录读取
+        if getattr(sys, 'frozen', False):
+            base = os.path.dirname(sys.executable)
+            # 优先使用 exe 同级 config.txt（用户可编辑），不存在则回退到内置默认
+            cfg_path = os.path.join(base, "config.txt")
+            if not os.path.exists(cfg_path):
+                cfg_path = os.path.join(sys._MEIPASS, "config.txt")
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+            cfg_path = os.path.join(base, "config.txt")
         if not os.path.exists(cfg_path):
             _config_cache = data
             return data
@@ -490,7 +512,16 @@ def _make_icon_image():
 
 def _run_server(port, debug):
     """在后台线程中启动 Flask。"""
-    app.run(host="127.0.0.1", port=port, debug=debug, use_reloader=False)
+    try:
+        app.run(host="127.0.0.1", port=port, debug=debug, use_reloader=False)
+    except Exception as e:
+        # console=False 时 stderr 不可见，写错误日志到 exe 同级目录
+        import traceback
+        log_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(log_dir, "error.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(f"Flask 启动失败：{e}\n\n{traceback.format_exc()}")
+        raise
 
 
 def run_tray(port, open_browser):
@@ -504,8 +535,9 @@ def run_tray(port, open_browser):
     url = f"http://127.0.0.1:{port}"
     server = threading.Thread(target=_run_server, args=(port, False), daemon=True)
     server.start()
-    time.sleep(1.5)  # 等服务就绪后再尝试打开浏览器
-    if open_browser:
+    time.sleep(2.0)  # 等服务就绪后再尝试打开浏览器
+    server_ok = server.is_alive()
+    if server_ok and open_browser:
         webbrowser.open(url)
 
     def open_home(icon, item):
@@ -522,7 +554,7 @@ def run_tray(port, open_browser):
     icon = pystray.Icon(
         "district_matcher",
         _make_icon_image(),
-        f"区划代码转换工具 · 端口 {port}",
+        f"区划代码转换工具 · 端口 {port}" + ("" if server_ok else "\n服务启动失败，请查看 error.log"),
         menu,
     )
     icon.run()
