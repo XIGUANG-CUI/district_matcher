@@ -190,7 +190,7 @@ excludes = [
     'tkinter.ttk',      # ttk 主题组件，不需要
     'unittest',         # 单元测试框架
     'test',             # 测试目录
-    'pydoc',            # 文档工具
+
     'distutils',        # 已废弃
     'setuptools',       # 安装工具
 ]

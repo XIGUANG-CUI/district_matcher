@@ -8,7 +8,8 @@ __pycache__/
 
 # pytest 缓存
 .pytest_cache/
-
+dist/
+build/
 # SQLite 数据库文件（运行时数据，不应入库）
 *.db
 
