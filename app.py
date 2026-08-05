@@ -431,10 +431,11 @@ def history_page():
 def query_page():
     result = None
     if request.method == "POST":
-        id_card = request.form.get("id_card", "")
-        address = request.form.get("address", "")
-        if id_card:
-            # P12：查询页需展示匹配过程，构建 detail；API/SDK 单条匹配路径默认跳过
+        id_card = request.form.get("id_card", "").strip()
+        address = request.form.get("address", "").strip()
+        if id_card or address:
+            # 业务约定：证件框可输 18 位身份证或 6 位区划代码，地址框可单独查询；
+            # 两框不必都填。P12：查询页需展示匹配过程，构建 detail。
             res = match_service.run_match(db, id_card, address, with_detail=True)
             result = {
                 "province_code": res.province_code,
@@ -449,8 +450,10 @@ def query_page():
                 "decision_path": res.decision_path,
             }
         else:
-            flash("请输入身份证号。")
-    return render_template("query.html", result=result)
+            flash("请至少输入身份证/区划代码或地址。")
+    return render_template("query.html", result=result,
+                           id_card=request.form.get("id_card", "") if request.method == "POST" else "",
+                           address=request.form.get("address", "") if request.method == "POST" else "")
 
 
 # ------------------------- RESTful API -------------------------

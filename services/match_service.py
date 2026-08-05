@@ -1,7 +1,7 @@
 """匹配服务：执行双引擎匹配并写入结果表。"""
 from engine import engine1, engine2, decider
 from utils import validators
-from database.models import MatchResult
+from database.models import Engine1Result, MatchResult
 
 
 def _build_engine1_detail(e1):
@@ -32,23 +32,38 @@ def _build_engine2_detail(e2):
 def run_match(db, id_card, address, with_detail=False):
     """对单条数据执行双引擎匹配，返回 MatchResult。
 
+    业务约定（单条查询按真实使用调整）：
+    - 证件框可输入完整 18 位身份证 或 6 位区划代码，取前 6 位启动引擎①；
+    - 地址框输入地址即启动引擎②；
+    - 两框不必都填：只给证件（引擎①兜底）、只给地址（引擎②为主）均可；
+    - 不做 18 位/校验位强校验（用户仅以前 6 位作查询入口）；
+    - 证件无效（前 6 位非数字）且地址为空 -> 标“异常”。
+
     with_detail=True 时额外构建 engine1/engine2 过程文本（供存库与页面“详情”
     展示）；单条 API/SDK 路径无需展示过程，传 False（默认）可省去构建开销（P12）。
     """
-    # 边界情况处理：身份证格式异常直接标记“异常”，跳过引擎匹配（D6 接入校验）
-    if not validators.is_id_card_format(id_card):
+    id_card = (id_card or "").strip()
+    address = (address or "").strip()
+    first6 = validators.get_id_first6(id_card)
+    if not first6 and not address:
+        # 无任何有效输入：既非可用的区划/证件前缀，也无地址
         return MatchResult(
             match_status="异常",
             engine1_detail="未执行",
             engine2_detail="未执行",
-            decision_path="身份证格式异常（非18位或结构非法），跳过引擎匹配",
+            decision_path="未输入有效的身份证/区划代码或地址",
         )
-    e1 = engine1.engine1_match(db, id_card)
-    e2 = engine2.engine2_parse(db, address or "", id_card)
-    result = decider.dual_engine_decide(db, e1, e2)
+    # 引擎①：仅当前 6 位为数字时启动（兼容 6 位码 / 18 位证）
+    e1 = engine1.engine1_match(db, id_card) if first6 else None
+    # 引擎②：地址非空即启动
+    e2 = engine2.engine2_parse(db, address, id_card) if address else None
+    # 决策器：单引擎场景传空引擎①对象（决策器已兼容“引擎①全空”）
+    result = decider.dual_engine_decide(db, e1 or Engine1Result(), e2)
     if with_detail:
-        result.engine1_detail = _build_engine1_detail(e1)
-        result.engine2_detail = _build_engine2_detail(e2)
+        result.engine1_detail = (_build_engine1_detail(e1) if e1
+                                 else "未执行（未输入有效的身份证/区划代码）")
+        result.engine2_detail = (_build_engine2_detail(e2) if e2
+                                 else "未执行（未输入地址）")
     return result
 
 

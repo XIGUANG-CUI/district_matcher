@@ -2,16 +2,21 @@
 {% block title %}单条查询{% endblock %}
 {% block content %}
 <h3>单条查询</h3>
-<form method="post" class="mb-3">
+<p class="text-muted">可单独或组合输入：<strong>身份证号 / 6 位区划代码</strong>（启动引擎①）与
+    <strong>地址</strong>（启动引擎②），两框不必都填。不做 18 位/校验位强校验。</p>
+
+<form method="post" class="mb-3" id="query-form">
     <div class="mb-2">
-        <label class="form-label">身份证号</label>
-        <input type="text" name="id_card" class="form-control" maxlength="18"
-               placeholder="如 23010519890714291X">
+        <label class="form-label">身份证号 / 6 位区划代码</label>
+        <input type="text" name="id_card" class="form-control"
+               value="{{ id_card }}"
+               placeholder="如 230105（6位码）或 23010519890714291X（18位身份证）">
     </div>
     <div class="mb-2">
         <label class="form-label">地址</label>
         <input type="text" name="address" class="form-control"
-               placeholder="如 哈尔滨市道外区水泥路99-4号">
+               value="{{ address }}"
+               placeholder="如 黑龙江省哈尔滨市道外区水泥路99-4号">
     </div>
     <button class="btn btn-primary">查询</button>
 </form>
@@ -19,17 +24,49 @@
 {% if result %}
 <div class="card">
     <div class="card-body">
+        {% set badge = {
+            '正确': 'bg-success', '已解析': 'bg-info', '已解析(仅证件)': 'bg-info',
+            '需复核': 'bg-warning text-dark', '部分': 'bg-secondary',
+            '无匹配': 'bg-secondary', '异常': 'bg-danger'
+        } %}
         <h5 class="card-title">匹配结果
-            <span class="badge bg-info">{{ result.match_status }}</span></h5>
-        <table class="table table-sm">
-            <tr><th>省级</th><td>{{ result.province_name }}（{{ result.province_code }}）</td></tr>
-            <tr><th>市级</th><td>{{ result.city_name }}（{{ result.city_code }}）</td></tr>
-            <tr><th>区县级</th><td>{{ result.district_name }}（{{ result.district_code }}）</td></tr>
-        </table>
-        <h6>引擎①过程</h6><pre class="small">{{ result.engine1_detail }}</pre>
-        <h6>引擎②过程</h6><pre class="small">{{ result.engine2_detail }}</pre>
-        <h6>决策路径</h6><p class="small">{{ result.decision_path }}</p>
+            <span class="badge {{ badge.get(result.match_status, 'bg-secondary') }}">
+                {{ result.match_status }}</span>
+        </h5>
+
+        {% if result.match_status == '异常' %}
+            <div class="alert alert-danger py-2">{{ result.decision_path }}</div>
+        {% elif result.match_status == '无匹配' %}
+            <div class="alert alert-secondary py-2">{{ result.decision_path }}</div>
+        {% else %}
+            <table class="table table-sm">
+                <tr><th>省级</th><td>{{ result.province_name or '-' }}（{{ result.province_code or '-' }}）</td></tr>
+                <tr><th>市级</th><td>{{ result.city_name or '-' }}（{{ result.city_code or '-' }}）</td></tr>
+                <tr><th>区县级</th><td>{{ result.district_name or '-' }}（{{ result.district_code or '-' }}）</td></tr>
+            </table>
+        {% endif %}
+
+        {% if result.match_status != '异常' %}
+            <h6>引擎①过程</h6><pre class="small">{{ result.engine1_detail or '-' }}</pre>
+            <h6>引擎②过程</h6><pre class="small">{{ result.engine2_detail or '-' }}</pre>
+            <h6>决策路径</h6><p class="small">{{ result.decision_path or '-' }}</p>
+        {% endif %}
     </div>
 </div>
 {% endif %}
+
+<script>
+(function () {
+    var form = document.getElementById('query-form');
+    if (!form) return;
+    form.addEventListener('submit', function (e) {
+        var idc = (form.querySelector('[name=id_card]').value || '').trim();
+        var addr = (form.querySelector('[name=address]').value || '').trim();
+        if (!idc && !addr) {
+            e.preventDefault();
+            alert('请至少输入身份证/区划代码或地址。');
+        }
+    });
+})();
+</script>
 {% endblock %}
