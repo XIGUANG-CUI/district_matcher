@@ -5,10 +5,15 @@ from typing import Optional
 
 @dataclass
 class LevelResult:
-    """单级行政区划匹配结果。"""
+    """单级行政区划匹配结果。
+
+    mapped=True 表示该级代码经历史映射（t_history_mapping 旧码->新码）命中，
+    用于引擎①匹配过程详情展示（区分"现行直接命中"与"历史映射命中"）。
+    """
     code: Optional[str] = None
     name: Optional[str] = None
     matched: bool = False
+    mapped: bool = False
 
 
 @dataclass

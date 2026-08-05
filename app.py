@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import pandas as pd
 from database.db_manager import DBManager
+from database import history_data
 from services import import_service, match_service, export_service
 
 # PyInstaller 打包后（sys.frozen == True）须显式指定模板与静态文件路径
@@ -348,6 +349,84 @@ def template_district():
     return _send_xlsx_template(df, "区划导入模板", "区划导入模板.xlsx")
 
 
+
+@app.route("/template/history")
+def template_history():
+    """历史代码映射导入模板：旧代码/新代码/旧名称/新名称/变更类型/变更日期/备注。"""
+    df = pd.DataFrame([
+        {"旧代码": "230105", "新代码": "230104", "旧名称": "太平区",
+         "新名称": "道外区", "变更类型": "撤销合并", "变更日期": "2004",
+         "备注": "太平区2004年并入道外区"},
+        {"旧代码": "230182", "新代码": "230113", "旧名称": "双城市",
+         "新名称": "双城区", "变更类型": "撤市设区", "变更日期": "2014",
+         "备注": "双城市2014年撤市设区"},
+    ])
+    return _send_xlsx_template(df, "历史映射模板", "历史映射模板.xlsx")
+
+
+@app.route("/history", methods=["GET", "POST"])
+def history_page():
+    """历史代码映射管理页：查看 / 新增 / 删除 / 恢复默认 / 导入。"""
+    if request.method == "POST":
+        action = request.form.get("action")
+        if action == "add":
+            row = {
+                "old_code": request.form.get("old_code", "").strip() or None,
+                "new_code": request.form.get("new_code", "").strip() or None,
+                "old_name": request.form.get("old_name", "").strip() or None,
+                "new_name": request.form.get("new_name", "").strip() or None,
+                "change_type": request.form.get("change_type", "").strip() or None,
+                "change_date": request.form.get("change_date", "").strip() or None,
+                "remark": request.form.get("remark", "").strip() or None,
+            }
+            if not ((row["old_code"] and row["new_code"]) or
+                    (row["old_name"] and row["new_name"])):
+                flash("新增失败：至少填写（旧代码+新代码）或（旧名称+新名称）。")
+            else:
+                db.insert_history_mapping(row)
+                _log(f"新增/更新历史映射："
+                     f"{row.get('old_name') or row.get('old_code') or '-'} -> "
+                     f"{row.get('new_name') or row.get('new_code') or '-'}")
+                flash("历史映射已保存。")
+        elif action == "delete":
+            try:
+                mid = int(request.form.get("id", 0))
+            except (TypeError, ValueError):
+                mid = 0
+            if mid:
+                db.delete_history_mapping(mid)
+                _log(f"删除历史映射记录 #{mid}")
+                flash("已删除。")
+        elif action == "reset":
+            db.reset_history_mappings()
+            _log("历史映射已恢复内置默认")
+            flash("已恢复内置默认映射。")
+        elif action == "import":
+            f = request.files.get("file")
+            if not f or not f.filename:
+                flash("请选择历史映射文件（.xlsx / .csv）。")
+            else:
+                path = os.path.join(config.UPLOAD_DIR, "_history_" + f.filename)
+                f.save(path)
+                try:
+                    summary = import_service.import_history_mappings(db, path)
+                    _log(f"导入历史映射：成功 {summary['imported']} 条，"
+                         f"跳过 {summary['skipped']} 条")
+                    flash(f"导入完成：成功 {summary['imported']} 条，"
+                          f"跳过 {summary['skipped']} 条。")
+                except Exception as e:
+                    flash(f"导入失败：{e}")
+                finally:
+                    try:
+                        os.remove(path)
+                    except Exception:
+                        pass
+        return redirect(url_for("history_page"))
+    mappings = db.list_history_mappings()
+    return render_template("history.html", mappings=mappings,
+                           builtin_count=len(history_data.HISTORY_SEED))
+
+
 @app.route("/query", methods=["GET", "POST"])
 def query_page():
     result = None
@@ -413,6 +492,59 @@ def api_match_batch():
             "match_status": res.match_status,
         })
     return jsonify({"code": 0, "data": out})
+
+
+# ------------------------- 历史映射管理 API -------------------------
+@app.route("/api/history/list")
+def api_history_list():
+    """历史映射列表（供其他程序集成读取）。"""
+    return jsonify({"code": 0, "data": db.list_history_mappings()})
+
+
+@app.route("/api/history/add", methods=["POST"])
+def api_history_add():
+    """新增/更新一条历史映射（JSON 或表单）。"""
+    data = request.get_json(force=True, silent=True) or request.form
+    row = {
+        "old_code": (data.get("old_code") or "").strip() or None,
+        "new_code": (data.get("new_code") or "").strip() or None,
+        "old_name": (data.get("old_name") or "").strip() or None,
+        "new_name": (data.get("new_name") or "").strip() or None,
+        "change_type": (data.get("change_type") or "").strip() or None,
+        "change_date": (data.get("change_date") or "").strip() or None,
+        "remark": (data.get("remark") or "").strip() or None,
+    }
+    if not ((row["old_code"] and row["new_code"]) or
+            (row["old_name"] and row["new_name"])):
+        return jsonify({"ok": False,
+                        "msg": "至少填写（旧代码+新代码）或（旧名称+新名称）。"}), 400
+    db.insert_history_mapping(row)
+    _log(f"API 新增/更新历史映射："
+         f"{row.get('old_name') or row.get('old_code') or '-'}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/history/delete", methods=["POST"])
+def api_history_delete():
+    """按记录 id 删除一条历史映射。"""
+    data = request.get_json(force=True, silent=True) or request.form
+    try:
+        mid = int(data.get("id", 0))
+    except (TypeError, ValueError):
+        mid = 0
+    if not mid:
+        return jsonify({"ok": False, "msg": "缺少 id。"}), 400
+    db.delete_history_mapping(mid)
+    _log(f"API 删除历史映射 #{mid}")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/history/reset", methods=["POST"])
+def api_history_reset():
+    """恢复历史映射为内置默认。"""
+    db.reset_history_mappings()
+    _log("API 恢复历史映射内置默认")
+    return jsonify({"ok": True})
 
 
 # ------------------------- 工具 -------------------------

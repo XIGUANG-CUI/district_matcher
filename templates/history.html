@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}历史映射管理{% endblock %}
+{% block content %}
+<h3>历史代码映射管理</h3>
+<p class="text-muted">维护“旧代码/旧名称 → 新代码/新名称”的映射，供引擎①旧码直查与引擎②地址别名翻译使用。
+    内置默认 <strong>{{ builtin_count }}</strong> 条（首次建库自动写入）；表内记录即引擎实际采用的映射，所见即所得。</p>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <h5 class="card-title">新增 / 更新映射</h5>
+        <form method="post" class="row g-2">
+            <input type="hidden" name="action" value="add">
+            <div class="col-md-3"><input name="old_code" class="form-control" placeholder="旧代码（6位，如 230105）"></div>
+            <div class="col-md-3"><input name="new_code" class="form-control" placeholder="新代码（6位，如 230104）"></div>
+            <div class="col-md-3"><input name="old_name" class="form-control" placeholder="旧名称（如 太平区）"></div>
+            <div class="col-md-3"><input name="new_name" class="form-control" placeholder="新名称（如 道外区）"></div>
+            <div class="col-md-3"><input name="change_type" class="form-control" placeholder="变更类型（如 撤县设区）"></div>
+            <div class="col-md-3"><input name="change_date" class="form-control" placeholder="变更年份（如 2004）"></div>
+            <div class="col-md-6"><input name="remark" class="form-control" placeholder="备注（可选）"></div>
+            <div class="col-md-12">
+                <button type="submit" class="btn btn-primary">保存</button>
+                <span class="text-muted small">提示：至少填写（旧代码+新代码）或（旧名称+新名称），同一旧代码重复保存即覆盖。</span>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <h5 class="card-title">批量导入 / 恢复默认</h5>
+        <form method="post" enctype="multipart/form-data" class="row g-2 align-items-center">
+            <input type="hidden" name="action" value="import">
+            <div class="col-md-6"><input type="file" name="file" class="form-control" accept=".xlsx,.csv"></div>
+            <div class="col-md-6">
+                <button type="submit" class="btn btn-outline-primary">上传导入</button>
+                <a href="{{ url_for('template_history') }}" class="btn btn-outline-secondary">下载模板</a>
+            </div>
+        </form>
+        <form method="post" class="mt-2" onsubmit="return confirm('确认恢复为内置默认映射？当前自定义记录将被覆盖。');">
+            <input type="hidden" name="action" value="reset">
+            <button type="submit" class="btn btn-outline-warning btn-sm">恢复内置默认（{{ builtin_count }} 条）</button>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <h5 class="card-title">当前映射（{{ mappings | length }} 条）</h5>
+        <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle">
+                <thead>
+                <tr>
+                    <th>#</th><th>旧代码</th><th>新代码</th><th>旧名称</th>
+                    <th>新名称</th><th>变更类型</th><th>变更年份</th><th>备注</th><th></th>
+                </tr>
+                </thead>
+                <tbody>
+                {% for m in mappings %}
+                    <tr>
+                        <td>{{ m.id }}</td>
+                        <td><code>{{ m.old_code or '-' }}</code></td>
+                        <td><code>{{ m.new_code or '-' }}</code></td>
+                        <td>{{ m.old_name or '-' }}</td>
+                        <td>{{ m.new_name or '-' }}</td>
+                        <td>{{ m.change_type or '-' }}</td>
+                        <td>{{ m.change_date or '-' }}</td>
+                        <td class="text-muted small">{{ m.remark or '' }}</td>
+                        <td>
+                            <form method="post" onsubmit="return confirm('确认删除该映射？');">
+                                <input type="hidden" name="action" value="delete">
+                                <input type="hidden" name="id" value="{{ m.id }}">
+                                <button type="submit" class="btn btn-outline-danger btn-sm">删除</button>
+                            </form>
+                        </td>
+                    </tr>
+                {% else %}
+                    <tr><td colspan="9" class="text-muted">暂无映射记录（内置默认仍生效）。</td></tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

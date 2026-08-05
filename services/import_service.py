@@ -328,3 +328,75 @@ def import_students(db, path, mapping=None, batch_id=None, on_progress=None):
     if on_progress:
         on_progress(total, total, {"phase": "done", "detail": "导入完成"})
     return {"batch_id": batch_id, "imported": len(rows)}
+
+
+def detect_history_columns(df, mapping=None):
+    """返回历史映射表的列映射（用户指定优先，否则自动识别）。"""
+    keyword_map = {
+        "old_code": ["旧代码", "旧码", "old_code", "oldcode", "old"],
+        "new_code": ["新代码", "新码", "new_code", "newcode", "new"],
+        "old_name": ["旧名称", "旧名", "old_name", "oldname"],
+        "new_name": ["新名称", "新名", "new_name", "newname"],
+        "change_type": ["变更", "类型", "change_type", "changetype"],
+        "change_date": ["日期", "年份", "change_date", "changedate", "date"],
+        "remark": ["备注", "remark", "说明"],
+    }
+    return mapping or _auto_map(list(df.columns), keyword_map)
+
+
+def _norm_history_code(val):
+    """历史映射代码规范化为 6 位数字串；12 位取前 6 位，其余去除非数字。"""
+    if val is None:
+        return None
+    s = str(val).strip().replace(" ", "").replace("	", "")
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return None
+    return digits[:6]
+
+
+def import_history_mappings(db, path, column_mapping=None):
+    """导入历史代码映射 Excel/CSV。
+
+    列：旧代码 / 新代码 / 旧名称 / 新名称 / 变更类型 / 变更日期 / 备注。
+    校验：每行至少提供 (旧代码+新代码) 或 (旧名称+新名称) 之一，否则跳过；
+    以 old_code 为自然键 upsert（存在则覆盖）。
+    返回 {"imported": n, "skipped": n}。
+    """
+    if path.lower().endswith(".csv"):
+        df = pd.read_csv(path, dtype=str)
+    else:
+        df = pd.read_excel(path, dtype=str)
+    df = df.where(pd.notna(df), None)
+    detected = column_mapping or detect_history_columns(df)
+    if not detected.get("old_code") and not detected.get("old_name"):
+        raise ValueError("无法识别“旧代码”或“旧名称”列，请使用模板后重试。")
+    records = df.to_dict("records")
+    rows = []
+    skipped = 0
+    for r in records:
+        old_code = (_norm_history_code(r.get(detected["old_code"]))
+                    if detected.get("old_code") else None)
+        new_code = (_norm_history_code(r.get(detected["new_code"]))
+                    if detected.get("new_code") else None)
+        old_name = (_clean_cell(r.get(detected["old_name"]))
+                    if detected.get("old_name") else None)
+        new_name = (_clean_cell(r.get(detected["new_name"]))
+                    if detected.get("new_name") else None)
+        if not ((old_code and new_code) or (old_name and new_name)):
+            skipped += 1
+            continue
+        rows.append({
+            "old_code": old_code,
+            "new_code": new_code,
+            "old_name": old_name,
+            "new_name": new_name,
+            "change_type": (_clean_cell(r.get(detected["change_type"]))
+                            if detected.get("change_type") else None),
+            "change_date": (_clean_cell(r.get(detected["change_date"]))
+                            if detected.get("change_date") else None),
+            "remark": (_clean_cell(r.get(detected["remark"]))
+                       if detected.get("remark") else None),
+        })
+    db.insert_history_mappings(rows)
+    return {"imported": len(rows), "skipped": skipped}

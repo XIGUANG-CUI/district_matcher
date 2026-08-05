@@ -33,6 +33,12 @@ class DBManager:
         self._by_id = {}          # id -> row
         self._by_name_level = {}  # (district_name, admin_level) -> [row, ...]
         self._by_name = {}        # district_name -> [row, ...]
+        # 历史代码映射缓存（t_history_mapping，小表：内置种子 + 用户增删）
+        self._history_loaded = False
+        self._history_seeded = False
+        self._history_rows = []   # DB 记录（含 id）
+        self._history_alias = {}  # 旧名 -> 新名
+        self._history_code = {}   # 旧码 -> 新码
         self._init_db()
 
     # ------------------------- 连接 -------------------------
@@ -75,6 +81,9 @@ class DBManager:
             self._conn.execute("DELETE FROM t_history_mapping")
             self._conn.commit()
         self._invalidate_cache()
+        # 重置后回到出厂状态：历史映射在下次访问时重新写入内置种子
+        self._history_seeded = False
+        self._invalidate_history()
 
     # ------------------------- 区划字典内存缓存（P03） -------------------------
     def _ensure_cache(self):
@@ -311,6 +320,142 @@ class DBManager:
             params.append(status)
         sql += " ORDER BY r.id"
         return pd.read_sql_query(sql, self._conn, params=params)
+
+
+
+    # ------------------------- 历史代码映射（t_history_mapping） -------------------------
+    def _ensure_history(self):
+        """确保历史映射已加载；首次建库（表从未写入）时自动写入内置种子。
+
+        种子语义：内置默认仅在建库后第一次访问（或 reset_db 重置后）写入；
+        之后表为唯一权威——用户删除/修改的记录即时生效，不会被内置兜底覆盖。
+        """
+        if self._history_loaded:
+            return
+        with self._lock:
+            if self._history_loaded:
+                return
+            rows = self._conn.execute(
+                "SELECT * FROM t_history_mapping").fetchall()
+            if not rows and not self._history_seeded:
+                self._seed_history_locked()
+                rows = self._conn.execute(
+                    "SELECT * FROM t_history_mapping").fetchall()
+            self._history_rows = [dict(r) for r in rows]
+            self._history_alias = {}
+            self._history_code = {}
+            for d in self._history_rows:
+                if d.get("old_name") and d.get("new_name"):
+                    self._history_alias[d["old_name"]] = d["new_name"]
+                if d.get("old_code") and d.get("new_code"):
+                    self._history_code[d["old_code"]] = d["new_code"]
+            self._history_loaded = True
+
+    def _seed_history_locked(self):
+        """向 t_history_mapping 写入内置种子（须在持锁状态下调用）。"""
+        from database import history_data
+        sql = (
+            "INSERT INTO t_history_mapping "
+            "(old_code, new_code, old_name, new_name, change_type, change_date, remark) "
+            "VALUES (:old_code, :new_code, :old_name, :new_name, "
+            ":change_type, :change_date, :remark)"
+        )
+        self._conn.executemany(sql, history_data.HISTORY_SEED_ROWS)
+        self._conn.commit()
+        self._history_seeded = True
+
+    def _invalidate_history(self):
+        """清空历史映射缓存（保留 _history_seeded 标志，避免用户删除后自动回种）。"""
+        self._history_loaded = False
+        self._history_rows = []
+        self._history_alias = {}
+        self._history_code = {}
+
+    def get_history_alias_map(self):
+        """旧名称 -> 现行名称 映射 dict（引擎②地址别名翻译用）。只读，勿修改。"""
+        self._ensure_history()
+        return self._history_alias
+
+    def get_history_code_map(self):
+        """旧 6 位代码 -> 现行 6 位代码 映射 dict（引擎①旧码直查用）。只读，勿修改。"""
+        self._ensure_history()
+        return self._history_code
+
+    def list_history_mappings(self):
+        """历史映射记录全量列表（含 id，按 old_code 排序）。"""
+        self._ensure_history()
+        rows = sorted(self._history_rows, key=lambda r: r.get("old_code") or "")
+        return [dict(r) for r in rows]
+
+    def count_history_mappings(self):
+        self._ensure_history()
+        return len(self._history_rows)
+
+    def insert_history_mapping(self, row):
+        """新增/更新一条映射：以 old_code 为自然键，存在则替换（保留其余记录）。
+
+        写入前先 _ensure_history()，保证首次操作即触发内置种子（而非绕过）。
+        """
+        self._ensure_history()
+        row = self._normalize_history_row(row)
+        with self._lock:
+            if row.get("old_code"):
+                self._conn.execute(
+                    "DELETE FROM t_history_mapping WHERE old_code = ?",
+                    (row["old_code"],))
+            self._conn.execute(
+                "INSERT INTO t_history_mapping "
+                "(old_code, new_code, old_name, new_name, change_type, change_date, remark) "
+                "VALUES (:old_code, :new_code, :old_name, :new_name, "
+                ":change_type, :change_date, :remark)", row)
+            self._conn.commit()
+        self._invalidate_history()
+
+    def insert_history_mappings(self, rows):
+        """批量新增/更新：按 old_code 替换，单次事务提交。"""
+        if not rows:
+            return
+        self._ensure_history()
+        rows = [self._normalize_history_row(r) for r in rows]
+        with self._lock:
+            seen = set()
+            for row in rows:
+                oc = row.get("old_code")
+                if oc and oc not in seen:
+                    seen.add(oc)
+                    self._conn.execute(
+                        "DELETE FROM t_history_mapping WHERE old_code = ?", (oc,))
+            self._conn.executemany(
+                "INSERT INTO t_history_mapping "
+                "(old_code, new_code, old_name, new_name, change_type, change_date, remark) "
+                "VALUES (:old_code, :new_code, :old_name, :new_name, "
+                ":change_type, :change_date, :remark)", rows)
+            self._conn.commit()
+        self._invalidate_history()
+
+    @staticmethod
+    def _normalize_history_row(row):
+        """补齐历史映射行缺失的字段（默认为 None），避免 SQL 绑定缺失键报错。"""
+        base = {"old_code": None, "new_code": None, "old_name": None,
+                "new_name": None, "change_type": None, "change_date": None,
+                "remark": None}
+        base.update({k: v for k, v in (row or {}).items()})
+        return base
+
+    def delete_history_mapping(self, mapping_id):
+        """按记录 id 删除一条历史映射。"""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM t_history_mapping WHERE id = ?", (mapping_id,))
+            self._conn.commit()
+        self._invalidate_history()
+
+    def reset_history_mappings(self):
+        """清空历史映射并恢复内置种子（管理页“恢复默认”按钮）。"""
+        with self._lock:
+            self._conn.execute("DELETE FROM t_history_mapping")
+            self._seed_history_locked()
+        self._invalidate_history()
 
 
 SCHEMA_SQL = """

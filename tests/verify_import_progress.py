@@ -5,7 +5,7 @@ import csv
 import time
 import tempfile
 
-ROOT = r"C:\Users\Administrator\Documents\Workbuddy_projects2\district_matcher"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import config

@@ -43,5 +43,17 @@ def engine1_match(db, id_card):
     if dist and dist["district_name"] != "市辖区":
         res.district = LevelResult(code=dist["district_code"],
                                    name=dist["district_name"], matched=True)
+    else:
+        # 历史代码映射直查：身份证签发地代码已撤销（如 230105 太平区）时，
+        # 经 t_history_mapping 旧码->新码 翻译后按现行代码命中（引擎①兜底增强，
+        # 不影响决策器 v2 的“引擎②为主锚点”原则）。
+        code_map = db.get_history_code_map() or {}
+        new6 = code_map.get(first6)
+        if new6:
+            mapped = db.get_by_district_code(new6 + config.DISTRICT_PAD, 3)
+            if mapped and mapped["district_name"] != "市辖区":
+                res.district = LevelResult(code=mapped["district_code"],
+                                           name=mapped["district_name"],
+                                           matched=True, mapped=True)
 
     return res

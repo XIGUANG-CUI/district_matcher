@@ -19,41 +19,34 @@ _COUNTY_CANDIDATE_RE = re.compile(
     r"([\u4e00-\u9fa5]{1,10}?(?:自治县|市|县|区|旗|新区))"
 )
 
-# 常见"撤县设市/设区"历史名称映射：旧名 -> 当前标准名
-# 用于兼容地址中仍使用旧县/市名的情况（字典仅存新名，旧名需翻译后反查）
-_HISTORICAL_NAME_MAP = {
-    "嫩江县": "嫩江市",
-    "东宁县": "东宁市",
-    "漠河县": "漠河市",
-    "双城市": "双城区",
-    "普兰店市": "普兰店区",
-    "崇明县": "崇明区",
-    "吴江市": "吴江区",
-    "溧水县": "溧水区",
-    "高淳县": "高淳区",
-    "铜山县": "铜山区",
-    "绍兴县": "柯桥区",
-    "璧山县": "璧山区",
-    "增城市": "增城区",
-    "金坛市": "金坛区",
-    "江都市": "江都区",
-}
-
-
+# 历史名称映射（旧名 -> 新名）已库化：迁移至 t_history_mapping 表
+# （内置种子见 database/history_data.py，首次建库自动写入，之后以表内记录为准）。
+# 引擎②通过 db.get_history_alias_map() 读取，兼容地址中仍使用旧县/市名的情况。
 def _lookup_county(db, name, city_pid=None):
-    """按名称查层级3，支持历史别名映射；返回 (row, 实际命中的标准名)。"""
+    """按名称查层级3，支持历史别名映射；返回 (row, 实际命中的标准名)。
+
+    顺序设计（v2.3，修复同名跨区误配）：
+    1) 有别名时优先尝试别名——地址旧名多为已撤销区划（如哈尔滨"太平区"），
+       若先查旧名本身，全局反查会误命中同名现行区划（如阜新市太平区）。
+    2) 全部候选先限在当前市级范围(pid)内反查，范围内未命中才做全局兜底，
+       避免"哈尔滨太平区"先命中"阜新太平区"。
+    """
     if not name:
         return None, name
-    candidates = [name]
-    alias = _HISTORICAL_NAME_MAP.get(name)
-    if alias and alias not in candidates:
-        candidates.append(alias)
-    for try_name in candidates:
-        row = None
-        if city_pid:
+    alias = (db.get_history_alias_map() or {}).get(name)
+    if alias and alias != name:
+        candidates = [alias, name]
+    else:
+        candidates = [name]
+    # 1) 优先在当前市级范围内反查（避免同名跨区误配）
+    if city_pid:
+        for try_name in candidates:
             row = db.reverse_lookup(try_name, 3, pid=city_pid)
-        if not row:
-            row = db.reverse_lookup(try_name, 3)
+            if row:
+                return row, try_name
+    # 2) 全局兜底（无市级范围，或范围内均未命中）
+    for try_name in candidates:
+        row = db.reverse_lookup(try_name, 3)
         if row:
             return row, try_name
     return None, name
@@ -94,15 +87,31 @@ def _apply_county(db, res, county_row, city_pid_holder):
     res.district_code = county_row["district_code"]
     parent = db.get_by_id(county_row["pid"]) if county_row.get("pid") else None
     if parent and parent["admin_level"] == 2:
-        # 县级市/县的上层是地级市
-        res.city = parent["district_name"]
-        res.city_code = parent["district_code"]
-        city_pid_holder[0] = parent["id"]
-        if not res.province:
-            pp = db.get_by_id(parent["pid"])
+        if parent["district_name"] == "市辖区":
+            # 直辖市虚拟节点（真实库中区县 pid 指向"市辖区"）：市级即省级本身，
+            # 与 parse_address / 引擎①直辖市约定一致，避免 city 被覆盖为"市辖区"
+            # 导致决策器误判省/市冲突（名称比对 北京市 vs 市辖区）。
+            pp = db.get_by_id(parent["pid"]) if parent.get("pid") else None
             if pp and pp["admin_level"] == 1:
                 res.province = pp["district_name"]
                 res.province_code = pp["district_code"]
+                res.city = pp["district_name"]
+                res.city_code = pp["district_code"]
+            elif res.province:
+                res.city = res.province
+                res.city_code = res.province_code
+            if city_pid_holder is not None:
+                city_pid_holder[0] = parent["id"]
+        else:
+            # 县级市/县的上层是地级市
+            res.city = parent["district_name"]
+            res.city_code = parent["district_code"]
+            city_pid_holder[0] = parent["id"]
+            if not res.province:
+                pp = db.get_by_id(parent["pid"])
+                if pp and pp["admin_level"] == 1:
+                    res.province = pp["district_name"]
+                    res.province_code = pp["district_code"]
     elif parent and parent["admin_level"] == 1:
         # 省直管县/直辖市：city 置为省/市名（与 parser/引擎①直辖市约定一致）
         res.city = parent["district_name"]

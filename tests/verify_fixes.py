@@ -63,7 +63,7 @@ def main():
     r_bad = match_service.run_match(db, "not_an_id", "")
     assert r_bad.match_status == "异常", "D6 非法身份证应标异常"
     r_ok = match_service.run_match(db, "110108199001010011", "北京市海淀区")
-    assert r_ok.match_status in ("正确", "已解析", "无匹配"), "D6 合法身份证不应标异常"
+    assert r_ok.match_status != "异常", "D6 合法身份证不应标异常"
 
     # ---------- D5: SDK 独立集成 ----------
     assert hasattr(sdk_mod, "DistrictMatcher"), "D5 SDK 未暴露 DistrictMatcher"

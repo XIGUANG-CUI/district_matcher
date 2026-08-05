@@ -12,8 +12,9 @@ def _build_engine1_detail(e1):
                  f"{'✅' if e1.province.matched else '❌'}")
     lines.append(f"市级：{e1.city.name or '未命中'}（{e1.city.code or '-'}）"
                  f"{'✅' if e1.city.matched else '❌'}")
+    dist_note = "（历史映射）" if getattr(e1.district, "mapped", False) else ""
     lines.append(f"区县：{e1.district.name or '未命中'}（{e1.district.code or '-'}）"
-                 f"{'✅' if e1.district.matched else '❌'}")
+                 f"{'✅' if e1.district.matched else '❌'}{dist_note}")
     return "\n".join(lines)
 
 
