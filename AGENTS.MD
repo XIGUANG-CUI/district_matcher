@@ -516,56 +516,98 @@ D4	❌ 无输出	❌ 无	-	-	无匹配
 
 结果展示卡片（状态徽章配色；异常/无匹配显示提示而非空表格；
 查询后输入值自动回填，便于对照）
-API接口设计（预留集成接口）
-RESTful API
-单条查询接口：
-POST /api/match
-请求体（id_card 可传 18 位身份证或 6 位区划代码；与地址可只传其一）：
-{
-    "id_card": "23010519890714291X",
-    "address": "哈尔滨市道外区水泥路99-4号"
-}
+接口集成（RESTful API + Python SDK，已实现）
+程序对外提供两类接口：RESTful API（HTTP/JSON，供任意语言调用）与 Python SDK（进程内直接调用）。
 
+一、通用约定（两类接口一致）
+- 输入：证件号/6位区划代码 + 地址，两字段不必都填（可只给证件、只给地址、或都给）。
+- 业务规则：证件框取前6位启动引擎①（兼容 6位码 与 18位身份证）；地址非空启动引擎②；
+  不做 18位/校验位强校验。
+- 输出三级字段：
+  province_code/province_name  省级 12 位代码 / 名称（如 230000000000 / 黑龙江省）
+  city_code/city_name          市级 12 位代码 / 名称（如 230100000000 / 哈尔滨市）
+  district_code/district_name  区县级 12 位代码 / 名称（如 230104000000 / 道外区）
+  match_status                 匹配状态（见下）
+- 状态枚举（v2）：正确 / 已解析 / 已解析(仅证件) / 需复核 / 部分 / 无匹配 / 异常。
+  - 正确：双引擎校验一致；已解析：引擎②为主；已解析(仅证件)：仅引擎①；
+  - 需复核：省/市冲突或信息不足（输出以地址为准）；部分：仅省/市；无匹配；异常：无有效输入。
+
+二、RESTful API
+启动服务：
+  cd district_matcher && .\.venv\Scripts\python.exe app.py --no-tray
+  服务地址 http://127.0.0.1:5001（端口在 config.txt 的 PORT 修改）
+
+1) 单条匹配 POST /api/match
+请求体（JSON）：
+  { "id_card": "23010519890714291X", "address": "黑龙江省哈尔滨市道外区水泥路99-4号" }
+  - id_card：可传 18 位身份证或 6 位区划代码，可省略（省略则仅引擎②）；
+  - address：可省略（省略则仅引擎①）。
 响应：
-{
-    "code": 0,
-    "data": {
-        "province_code": "230000000000",
-        "province_name": "黑龙江省",
-        "city_code": "230100000000",
-        "city_name": "哈尔滨市",
-        "district_code": "230102000000",
-        "district_name": "道外区",
-        "match_status": "已解析"
-    }
-}
-批量处理接口：
-POST /api/match/batch
-请求体：
-{
-    "students": [
-        {"name": "张三", "id_card": "23010519890714291X", "address": "哈尔滨市道外区..."},
-        ...
-    ]
-}
-Python SDK
-# 作为Python模块被其他程序调用（需将 district_matcher 目录加入 sys.path）
-import sys
-sys.path.insert(0, "/path/to/district_matcher")   # 包含 sdk/ 的目录
-from sdk.district_matcher import DistrictMatcher
+  { "code": 0, "data": {
+      "province_code": "230000000000", "province_name": "黑龙江省",
+      "city_code": "230100000000", "city_name": "哈尔滨市",
+      "district_code": "230104000000", "district_name": "道外区",
+      "match_status": "正确" } }
+curl 示例：
+  curl -X POST http://127.0.0.1:5001/api/match -H "Content-Type: application/json" \
+    -d '{"id_card":"230105","address":"黑龙江省哈尔滨市道外区水泥路99-4号"}'
+三种输入方式实测：
+  {"id_card":"230105"}                          -> 已解析(仅证件)，区县=道外区 230104
+  {"address":"北京市海淀区中关村大街1号"}         -> 已解析，市=北京市，区县=海淀区
+  {"id_card":"230105","address":"黑龙江省哈尔滨市道外区…"} -> 正确
 
-matcher = DistrictMatcher(db_path="district_matcher.db")
-result = matcher.match("23010519890714291X", "哈尔滨市道外区水泥路99-4号")
-print(result)
-# {
-#     "province_code": "230000000000",
-#     "province_name": "黑龙江省",
-#     "city_code": "230100000000", 
-#     "city_name": "哈尔滨市",
-#     "district_code": "230102000000",
-#     "district_name": "道外区",
-#     "match_status": "已解析"
-# }
+2) 批量匹配 POST /api/match/batch
+请求体：
+  { "students": [
+      { "name": "张三", "id_card": "23010519890714291X", "address": "哈尔滨市道外区水泥路99-4号" },
+      { "name": "李四", "id_card": "", "address": "北京市海淀区中关村大街1号" } ] }
+响应：{ "code": 0, "data": [ { "name": "张三", 省/市/区县字段..., "match_status": "正确" }, ... ] }
+（每条比单条多 name 字段。）
+
+3) 历史映射管理 API（v2.3）
+  GET  /api/history/list   全部历史映射：{ "code":0, "data":[ {id,old_code,new_code,old_name,
+                            new_name,change_type,change_date,remark}, ... ] }
+  POST /api/history/add    新增/更新一条（JSON 或表单）；以 old_code 为自然键覆盖；
+                           至少给 (old_code+new_code) 或 (old_name+new_name) 之一，否则 400
+  POST /api/history/delete {"id": 3} 删除一条
+  POST /api/history/reset  恢复内置默认 16 条
+  curl 示例：
+    curl -X POST http://127.0.0.1:5001/api/history/add -H "Content-Type: application/json" \
+      -d '{"old_code":"999999","new_code":"888888","old_name":"旧名","new_name":"新名"}'
+
+三、Python SDK
+导入（SDK 会自动把项目根目录加入 sys.path，只要能 import 到 sdk 包即可）：
+  import sys
+  sys.path.insert(0, "/path/to/district_matcher")   # 包含 sdk/ 的目录
+  from sdk.district_matcher import DistrictMatcher
+初始化：
+  matcher = DistrictMatcher()                         # 默认用项目数据库
+  matcher = DistrictMatcher(db_path=r"D:\data\district_matcher.db")  # 或指定副本
+单条匹配：
+  result = matcher.match("23010519890714291X", "哈尔滨市道外区水泥路99-4号")
+  result = matcher.match("230105")                    # 6位码，仅引擎①
+  result = matcher.match("", "北京市海淀区中关村大街1号")  # 仅地址，引擎②
+  # 返回：{"province_code":..., "province_name":..., "city_code":...,
+  #        "city_name":..., "district_code":..., "district_name":..., "match_status":...}
+批量匹配：
+  results = matcher.match_batch([
+      {"name": "张三", "id_card": "23010519890714291X", "address": "哈尔滨市道外区..."},
+      {"name": "李四", "id_card": "", "address": "北京市海淀区中关村大街1号"},
+  ])   # 每条比 match 多 "name" 字段
+需要引擎过程详情时（SDK 默认不返回详情以省性能）：
+  from database.db_manager import DBManager
+  from services.match_service import run_match
+  res = run_match(db, "23010519890714291X", "哈尔滨市道外区...", with_detail=True)
+  print(res.match_status, res.engine1_detail, res.engine2_detail, res.decision_path)
+
+四、注意事项
+- 数据库就绪：接口依赖区划字典库（database/district_matcher.db，66 万行）。首次调用加载缓存
+  约 1.7 秒（v2.4 按需加载后），之后匹配为微秒级。
+- 并发：内部单长连接 + 线程锁，适合中等并发；Web 服务默认单进程，超高并发需多实例或连接池。
+- 只读语义：/api/match* 与 SDK match* 只读不写库；写库的只有导入/批量处理（页面）与历史映射 API。
+- 状态为“需复核”时：输出以引擎②（地址）为准，代码仍可用，但省/市与证件冲突，需人工核对。
+- 历史映射即时生效：/api/history/* 的增删改会即时影响匹配结果（引擎①旧码直查、引擎②别名翻译
+  都读它），改完无需重启。
 项目文件结构
 district_matcher/
 ├── app.py                      # Flask主应用
