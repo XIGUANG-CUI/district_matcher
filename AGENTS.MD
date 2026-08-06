@@ -76,7 +76,7 @@
 
 - **P01 连接复用**：`DBManager` 由每次查询 `connect()`/`close()` 改为进程内单一长连接（`check_same_thread=False` + `threading.Lock` 保护写），消除每名学生约 11 次建连开销。
 - **P02 批量事务**：新增 `insert_results_batch`，`process_batch` 收集结果后 `executemany` 单次提交，替代逐条 `insert_result` + 每次 `commit`（N 条学生由 N 次事务降为 1 次）。
-- **P03 区划字典内存缓存**：`t_district_code` 为只读小表，首次访问全量载入内存，`get_by_district_code`/`get_by_id`/`reverse_lookup`/`search_by_name` 走内存字典；`insert_districts`/`reset_db` 时自动失效，消除每条学生重复查库开销。
+- **P03 区划字典内存缓存（v2.4 按需加载）**：内存仅常驻 **level 1-4**（省/市/区县/乡镇街道，约 4.5 万行）；**level 5（村/社区，约 62 万行）为冷路径，按需走 SQL**（`search_by_name`/`reverse_lookup`/`get_by_district_code` 对 level 5 自动回退 SQL）。实测内存从 ~777MB 降至 ~50MB、首次加载 5.1s→1.8s，热路径批量吞吐不降反升（小字典哈希更快）。`insert_districts`/`reset_db` 时自动失效，消除每条学生重复查库开销。
 - **P05 决策器复用引擎②代码**：`decider` 优先复用引擎②已反查到的 `province_code`/`city_code`/`district_code`，仅在缺失时按名称补查，消除同一条流水内对相同区划的重复反查。
 - **P04 后台处理**：批量匹配改为后台线程执行，新增 `GET /api/result/progress?batch_id=` 进度接口与前端进度条轮询，避免大批次同步阻塞 HTTP 请求（不再受 Flask 请求超时限制）。
 

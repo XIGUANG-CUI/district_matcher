@@ -32,7 +32,6 @@ class DBManager:
         self._by_code = {}        # (district_code, admin_level) -> row
         self._by_id = {}          # id -> row
         self._by_name_level = {}  # (district_name, admin_level) -> [row, ...]
-        self._by_name = {}        # district_name -> [row, ...]
         # 历史代码映射缓存（t_history_mapping，小表：内置种子 + 用户增删）
         self._history_loaded = False
         self._history_seeded = False
@@ -86,24 +85,29 @@ class DBManager:
         self._invalidate_history()
 
     # ------------------------- 区划字典内存缓存（P03） -------------------------
+    # 内存缓存仅常驻 level 1-4（省/市/区县/乡镇街道）。
+    # level 5（村/社区，约 62 万行）为冷路径，按需走 SQL（方案 B：大幅降低内存占用）。
+    _CACHE_MAX_LEVEL = 4
+
     def _ensure_cache(self):
         if self._cache_loaded:
             return
         with self._lock:
             if self._cache_loaded:
                 return
-            rows = self._conn.execute("SELECT * FROM t_district_code").fetchall()
+            # 只加载引擎热路径所需的 level 1-4
+            rows = self._conn.execute(
+                "SELECT * FROM t_district_code WHERE admin_level <= ?",
+                (self._CACHE_MAX_LEVEL,)).fetchall()
             self._by_code = {}
             self._by_id = {}
             self._by_name_level = {}
-            self._by_name = {}
             for r in rows:
                 d = dict(r)
                 self._by_id[d["id"]] = d
                 self._by_code[(d["district_code"], d["admin_level"])] = d
                 self._by_name_level.setdefault(
                     (d["district_name"], d["admin_level"]), []).append(d)
-                self._by_name.setdefault(d["district_name"], []).append(d)
             self._cache_loaded = True
 
     def _invalidate_cache(self):
@@ -111,7 +115,26 @@ class DBManager:
         self._by_code = {}
         self._by_id = {}
         self._by_name_level = {}
-        self._by_name = {}
+
+    def _query_sql_districts(self, name=None, admin_level=None,
+                             district_code=None, pid=None):
+        """冷路径（level 5 / 不分层级名称搜索）走 SQL 兜底。"""
+        sql = "SELECT * FROM t_district_code WHERE 1=1"
+        params = []
+        if name is not None:
+            sql += " AND district_name = ?"
+            params.append(name)
+        if admin_level is not None:
+            sql += " AND admin_level = ?"
+            params.append(admin_level)
+        if district_code is not None:
+            sql += " AND district_code = ?"
+            params.append(district_code)
+        if pid is not None:
+            sql += " AND pid = ?"
+            params.append(pid)
+        rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
 
     # ------------------------- 区划代码 -------------------------
     def insert_districts(self, rows):
@@ -131,34 +154,45 @@ class DBManager:
     def get_by_district_code(self, district_code, admin_level=None):
         self._ensure_cache()
         if admin_level is not None:
-            return self._by_code.get((district_code, admin_level))
+            if admin_level <= self._CACHE_MAX_LEVEL:
+                # level 1-4 全量常驻内存，未命中即不存在（避免热路径 SQL 兜底）
+                return self._by_code.get((district_code, admin_level))
+            rows = self._query_sql_districts(district_code=district_code,
+                                             admin_level=admin_level)
+            return rows[0] if rows else None
         # 不带层级时保留原 fetchone 语义：按 1→2→3 顺序返回首个匹配
         for lvl in (1, 2, 3):
             row = self._by_code.get((district_code, lvl))
             if row:
                 return row
-        return None
+        rows = self._query_sql_districts(district_code=district_code)
+        return rows[0] if rows else None
 
     def get_by_id(self, row_id):
         self._ensure_cache()
         return self._by_id.get(row_id)
 
     def reverse_lookup(self, name, admin_level, pid=None):
-        """按名称+层级反查；可选限定父级 pid。"""
+        """按名称+层级反查；可选限定父级 pid。level 5 冷路径走 SQL。"""
         self._ensure_cache()
-        candidates = self._by_name_level.get((name, admin_level), [])
-        if pid is not None:
-            for r in candidates:
-                if r["pid"] == pid:
-                    return r
-            return None
-        return candidates[0] if candidates else None
+        if admin_level <= self._CACHE_MAX_LEVEL:
+            candidates = self._by_name_level.get((name, admin_level), [])
+            if pid is not None:
+                for r in candidates:
+                    if r["pid"] == pid:
+                        return r
+                return None
+            return candidates[0] if candidates else None
+        rows = self._query_sql_districts(name=name, admin_level=admin_level,
+                                         pid=pid)
+        return rows[0] if rows else None
 
     def search_by_name(self, name, admin_level=None):
         self._ensure_cache()
-        if admin_level is not None:
+        if admin_level is not None and admin_level <= self._CACHE_MAX_LEVEL:
             return list(self._by_name_level.get((name, admin_level), []))
-        return list(self._by_name.get(name, []))
+        # level 5 或不分层级：走 SQL（引擎当前仅以 level 4/5 触发该路径）
+        return self._query_sql_districts(name=name, admin_level=admin_level)
 
     def count_districts(self):
         row = self._conn.execute(
