@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block title %}区划匹配{% endblock %}
+
+{% block content %}
+<div class="container-fluid py-3" id="dm-app"
+     data-query-url="{{ url_for('district_match.query') }}"
+     data-preview-url="{{ url_for('district_match.preview') }}"
+     data-batch-url="{{ url_for('district_match.batch') }}"
+     data-progress-url="{{ url_for('district_match.progress', progress_id='__PID__') }}"
+     data-batches-url="{{ url_for('district_match.batches') }}"
+     data-results-url="{{ url_for('district_match.results', batch_id=0) }}"
+     data-export-url="{{ url_for('district_match.export_batch', batch_id=0) }}"
+     data-delete-url="{{ url_for('district_match.delete_batch', batch_id=0) }}"
+     data-dictionary-url="{{ url_for('district_match.dictionary') }}"
+     data-dict-import-url="{{ url_for('district_match.dictionary_import') }}"
+     data-history-url="{{ url_for('district_match.history') }}"
+     data-backfill-url="{{ url_for('district_match.backfill') }}">
+
+  <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
+    <div>
+      <h4 class="mb-1"><i class="bi bi-geo-alt"></i> 区划匹配</h4>
+      <div class="text-muted small">身份证前 6 位 + 地址文本双引擎匹配；结果写入批次记录，不直接改学生主表（除“批量补全区划”）。</div>
+    </div>
+    <div class="d-flex gap-2">
+      <button type="button" class="btn btn-outline-secondary btn-sm" id="dm-refresh-dict">
+        <i class="bi bi-arrow-clockwise"></i> 刷新字典状态
+      </button>
+      <button type="button" class="btn btn-outline-primary btn-sm" id="dm-backfill-btn" data-limit="5000">
+        <i class="bi bi-magic"></i> 批量补全区划（≤5000）
+      </button>
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <!-- 1. 单条查询 -->
+    <div class="col-12 col-xl-5">
+      <div class="card h-100">
+        <div class="card-header"><i class="bi bi-search"></i> 单条查询</div>
+        <div class="card-body">
+          <form id="dm-query-form" autocomplete="off">
+            <div class="mb-2">
+              <label class="form-label small text-muted" for="dm-id-card">身份证号（或 6 位区划代码）</label>
+              <input type="text" class="form-control" id="dm-id-card" maxlength="18"
+                     placeholder="可留空，与地址二选一">
+            </div>
+            <div class="mb-2">
+              <label class="form-label small text-muted" for="dm-address">地址</label>
+              <textarea class="form-control" id="dm-address" rows="2"
+                        placeholder="例：黑龙江省哈尔滨市道外区××街道"></textarea>
+            </div>
+            <button type="submit" class="btn btn-primary btn-sm" id="dm-query-btn">
+              <i class="bi bi-search"></i> 查询
+            </button>
+          </form>
+          <hr>
+          <div id="dm-query-summary" class="mb-2 text-muted small">尚未查询</div>
+          <dl class="row mb-0 small" id="dm-query-fields">
+            <dt class="col-5">省</dt><dd class="col-7" data-key="district_province_name">-</dd>
+            <dt class="col-5">省代码</dt><dd class="col-7" data-key="district_province_code">-</dd>
+            <dt class="col-5">市</dt><dd class="col-7" data-key="district_city_name">-</dd>
+            <dt class="col-5">市代码</dt><dd class="col-7" data-key="district_city_code">-</dd>
+            <dt class="col-5">县</dt><dd class="col-7" data-key="district_county_name">-</dd>
+            <dt class="col-5">县代码</dt><dd class="col-7" data-key="district_county_code">-</dd>
+            <dt class="col-5">匹配状态</dt><dd class="col-7" data-key="district_match_status">-</dd>
+          </dl>
+          <div class="mt-2">
+            <div class="small text-muted">引擎过程</div>
+            <pre class="small bg-light border rounded p-2 mb-0" id="dm-detail" style="white-space:pre-wrap;"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. 批量匹配 -->
+    <div class="col-12 col-xl-7">
+      <div class="card h-100">
+        <div class="card-header"><i class="bi bi-collection"></i> 批量匹配</div>
+        <div class="card-body">
+          <div class="btn-group btn-group-sm mb-3" role="group">
+            <input type="radio" class="btn-check" name="dm-source" id="dm-source-upload" value="upload" checked>
+            <label class="btn btn-outline-secondary" for="dm-source-upload">上传清单</label>
+            <input type="radio" class="btn-check" name="dm-source" id="dm-source-students" value="students">
+            <label class="btn btn-outline-secondary" for="dm-source-students">取在校学生</label>
+          </div>
+
+          <div id="dm-upload-panel">
+            <div class="row g-2 align-items-end">
+              <div class="col-12 col-md-6">
+                <label class="form-label small text-muted" for="dm-file">清单文件（xlsx / csv，≤10MB）</label>
+                <input type="file" class="form-control form-control-sm" id="dm-file" accept=".xlsx,.xlsm,.csv">
+              </div>
+              <div class="col-6 col-md-3">
+                <label class="form-label small text-muted" for="dm-col-id">身份证列</label>
+                <select class="form-select form-select-sm" id="dm-col-id"></select>
+              </div>
+              <div class="col-6 col-md-3">
+                <label class="form-label small text-muted" for="dm-col-addr">地址列</label>
+                <select class="form-select form-select-sm" id="dm-col-addr"></select>
+              </div>
+            </div>
+            <div class="mt-2">
+              <button type="button" class="btn btn-outline-primary btn-sm" id="dm-preview-btn">
+                <i class="bi bi-eye"></i> 预览前 10 行
+              </button>
+              <span class="text-muted small ms-2" id="dm-preview-hint">先选文件再预览，确认列映射后开始匹配</span>
+            </div>
+            <div class="table-responsive mt-2 d-none" id="dm-preview-wrap">
+              <table class="table table-sm table-bordered align-middle mb-0" id="dm-preview-table">
+                <thead></thead><tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div id="dm-students-panel" class="d-none">
+            <div class="alert alert-light border small mb-0">
+              将按“在校且未删除”口径（复用 <code>_non_graduated_where()</code>）取出学生，逐条匹配后写批次记录。
+              不修改学生主表。
+            </div>
+          </div>
+
+          <div class="mt-3">
+            <button type="button" class="btn btn-primary btn-sm" id="dm-batch-btn">
+              <i class="bi bi-play-fill"></i> 开始匹配
+            </button>
+          </div>
+
+          <div class="mt-3 d-none" id="dm-progress-wrap">
+            <div class="progress" style="height: 18px;">
+              <div class="progress-bar" id="dm-progress-bar" role="progressbar" style="width: 0%"></div>
+            </div>
+            <div class="small text-muted mt-1" id="dm-progress-text"></div>
+          </div>
+
+          <div class="mt-3 d-none" id="dm-result-wrap">
+            <div class="d-flex justify-content-between align-items-center mb-2">
+              <div class="small text-muted" id="dm-result-title"></div>
+              <div class="d-flex gap-2">
+                <a class="btn btn-outline-success btn-sm d-none" id="dm-export-link" href="#">
+                  <i class="bi bi-download"></i> 导出
+                </a>
+              </div>
+            </div>
+            <div class="table-responsive" style="max-height: 320px;">
+              <table class="table table-sm table-hover align-middle mb-0" id="dm-result-table">
+                <thead class="table-light">
+                  <tr>
+                    <th>姓名</th><th>身份证</th><th>地址</th>
+                    <th>省</th><th>市</th><th>县</th><th>状态</th><th>说明</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. 批次记录 -->
+    <div class="col-12 col-xl-7">
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span><i class="bi bi-clock-history"></i> 批次记录</span>
+          <button type="button" class="btn btn-outline-secondary btn-sm" id="dm-batches-refresh">
+            <i class="bi bi-arrow-clockwise"></i> 刷新
+          </button>
+        </div>
+        <div class="card-body p-0">
+          <div class="table-responsive">
+            <table class="table table-sm table-hover align-middle mb-0" id="dm-batch-table">
+              <thead class="table-light">
+                <tr><th>批次号</th><th>来源</th><th>总数</th><th>状态</th><th>创建人</th><th>时间</th><th class="text-end">操作</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. 字典状态 + 历史映射 -->
+    <div class="col-12 col-xl-5">
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span><i class="bi bi-database-check"></i> 字典状态</span>
+          <button type="button" class="btn btn-outline-primary btn-sm" id="dm-dict-import-btn">
+            <i class="bi bi-box-arrow-in-down"></i> 导入数据包
+          </button>
+        </div>
+        <div class="card-body small" id="dm-dict-body">
+          <div class="text-muted">加载中…</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header"><i class="bi bi-signpost-split"></i> 历史映射（只读）</div>
+        <div class="card-body p-0">
+          <div class="table-responsive" style="max-height: 240px;">
+            <table class="table table-sm mb-0" id="dm-history-table">
+              <thead class="table-light"><tr><th>旧码</th><th>旧名</th><th>新码</th><th>新名</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="small text-muted p-2 border-top">
+            本期只读展示；增删改留到有明确需求时再做（15.2 #6）。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/district_match.js') }}" defer></script>
+{% endblock %}

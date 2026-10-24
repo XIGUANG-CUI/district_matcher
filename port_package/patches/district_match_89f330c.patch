@@ -1,0 +1,4386 @@
+diff --git a/app.py b/app.py
+index 571cfa1..21e3e97 100644
+--- a/app.py
++++ b/app.py
+@@ -55,6 +55,8 @@ app.register_blueprint(leave_cancel_bp)
+ app.register_blueprint(lifecycle_bp)
+ from blueprints.api import bp as api_bp
+ app.register_blueprint(api_bp)
++from blueprints.district_match import bp as district_match_bp
++app.register_blueprint(district_match_bp)
+ 
+ # ========== 安全防护 ==========
+ 
+@@ -124,7 +126,8 @@ def _inject_field_help():
+         'import_fields': list(config.ALL_STUDENT_FIELDS),
+         'import_count': len(config.ALL_STUDENT_FIELDS),
+         'required_fields': ['学生姓名', '学生身份证号', '学号'],
+-        'auto_fields': ['年龄', '姓名拼音'],
++        'auto_fields': ['年龄', '姓名拼音', '省', '省区划代码', '市', '市区划代码',
++                        '县', '县区划代码', '匹配状态'],
+         'is_admin': user_role == 'admin',
+         'insurance_fields': ['学平险保单号', '学平险缴费日期', '学平险到期时间',
+                              '学平险保费金额', '实习险缴费日期', '主管标记',
+diff --git a/blueprints/district_match.py b/blueprints/district_match.py
+new file mode 100644
+index 0000000..50e1fd1
+--- /dev/null
++++ b/blueprints/district_match.py
+@@ -0,0 +1,491 @@
++# -*- coding: utf-8 -*-
++"""区划匹配 Blueprint（页面 + API）。
++
++路由清单见 CHANGES.md；响应统一 {success, data|message}。
++批量/导入为后台线程 + 内存进度表（单进程部署，重启即失效）。
++"""
++import json
++import logging
++import os
++import threading
++import time
++import uuid
++
++from flask import (Blueprint, current_app, jsonify, render_template, request,
++                   send_file, session)
++
++import auth
++import config
++from auth import _require_admin_json, _require_login_json
++from models import district as district_model
++from services.district_match import exporter, importer, runner
++from services.district_match import pack as pack_mod
++
++logger = logging.getLogger(__name__)
++
++bp = Blueprint("district_match", __name__)
++
++_ALLOWED_INPUT_EXT = (".xlsx", ".xlsm", ".csv")
++_progress = {}
++_progress_lock = threading.Lock()
++_batch_lock = threading.Lock()
++_import_lock = threading.Lock()
++_PROGRESS_TTL = 3600
++
++
++# ------------------------------------------------------------------ 工具
++def _ok(data=None, **extra):
++    payload = {"success": True}
++    if data is not None:
++        payload["data"] = data
++    payload.update(extra)
++    return jsonify(payload)
++
++
++def _fail(message, status=400):
++    return jsonify({"success": False, "message": message}), status
++
++
++def _new_progress(kind):
++    pid = uuid.uuid4().hex
++    now = time.time()
++    with _progress_lock:
++        # 惰性清理超过 1 小时的进度
++        for key in [k for k, v in _progress.items() if now - v.get("ts", now) > _PROGRESS_TTL]:
++            _progress.pop(key, None)
++        _progress[pid] = {"kind": kind, "status": "running", "phase": "",
++                          "done": 0, "total": 0, "message": "", "ts": now}
++    return pid
++
++
++def _update_progress(pid, **fields):
++    with _progress_lock:
++        item = _progress.get(pid)
++        if item is None:
++            return
++        item.update(fields)
++        item["ts"] = time.time()
++
++
++def _spawn(pid, target):
++    """在后台线程执行 target(app, pid)；线程内独立 app context + 独立连接。"""
++    app_obj = current_app._get_current_object()
++
++    def _worker():
++        with app_obj.app_context():
++            try:
++                target(app_obj, pid)
++            except Exception as exc:  # 线程异常只落日志 + 进度，不打印堆栈到前端
++                logger.exception("区划后台任务失败：%s", exc)
++                _update_progress(pid, status="error", message=str(exc)[:300])
++
++    thread = threading.Thread(target=_worker, daemon=True)
++    thread.start()
++
++
++def _upload_dir():
++    path = os.path.join(config.UPLOAD_FOLDER, "district_match")
++    os.makedirs(path, exist_ok=True)
++    return path
++
++
++def _save_upload(storage):
++    ext = os.path.splitext(storage.filename or "")[1].lower()
++    if ext not in _ALLOWED_INPUT_EXT:
++        raise ValueError("仅支持 .xlsx / .xlsm / .csv 文件")
++    name = uuid.uuid4().hex + ext
++    path = os.path.join(_upload_dir(), name)
++    storage.save(path)
++    return path
++
++
++def _result_payload(result):
++    return {
++        "district_province_name": result.province_name or "",
++        "district_province_code": result.province_code or "",
++        "district_city_name": result.city_name or "",
++        "district_city_code": result.city_code or "",
++        "district_county_name": result.district_name or "",
++        "district_county_code": result.district_code or "",
++        "district_match_status": result.match_status or "",
++        "match_status": result.match_status or "",
++        "engine1_detail": result.engine1_detail,
++        "engine2_detail": result.engine2_detail,
++        "decision_path": result.decision_path,
++    }
++
++
++# ------------------------------------------------------------------ 页面
++@bp.route("/admin/district-match")
++@auth.admin_required
++def page():
++    """区划匹配页面（仅 admin）。"""
++    return render_template("admin/district_match.html")
++
++
++# ------------------------------------------------------------------ 单条查询
++@bp.route("/api/district-match/query", methods=["POST"])
++def query():
++    err = _require_admin_json()
++    if err:
++        return err
++    data = request.get_json(silent=True) or {}
++    id_card = (data.get("id_card") or "").strip()
++    address = (data.get("address") or "").strip()
++    if not id_card and not address:
++        return _fail("请输入身份证号或地址")
++    try:
++        result = runner.run_match(district_model.DistrictRepository(),
++                                  id_card, address, with_detail=True)
++    except district_model.DistrictDbMissing:
++        return _fail("区划字典尚未导入，请先在“字典状态”中导入数据包", 409)
++    return _ok(_result_payload(result))
++
++
++# ------------------------------------------------------------------ 批量：预览 / 启动
++@bp.route("/api/district-match/preview", methods=["POST"])
++def preview():
++    err = _require_admin_json()
++    if err:
++        return err
++    storage = request.files.get("file")
++    if not storage or not storage.filename:
++        return _fail("请选择上传文件")
++    path = None
++    try:
++        path = _save_upload(storage)
++        headers, rows = importer.read_input_rows(path, limit=10)
++        if not headers:
++            return _fail("文件为空或缺少表头")
++        guessed = {"id_card": "", "address": ""}
++        for key in headers:
++            if "身份证" in key:
++                guessed["id_card"] = key
++            if "地址" in key or "住址" in key:
++                guessed["address"] = key
++        return _ok({"headers": headers, "rows": rows, "suggest": guessed,
++                    "total_estimate": len(rows)})
++    except ValueError as exc:
++        return _fail(str(exc))
++    finally:
++        if path and os.path.exists(path):
++            try:
++                os.remove(path)
++            except OSError:
++                pass
++
++
++@bp.route("/api/district-match/batch", methods=["POST"])
++def batch():
++    err = _require_admin_json()
++    if err:
++        return err
++    if not _batch_lock.acquire(blocking=False):
++        return _fail("已有批量任务在执行，请稍后再试", 409)
++
++    staging = None
++    try:
++        source = "upload"
++        student_ids = []
++        id_card_col = address_col = None
++        if request.files.get("file"):
++            staging = _save_upload(request.files["file"])
++            id_card_col = (request.form.get("id_card_col") or "").strip()
++            address_col = (request.form.get("address_col") or "").strip()
++            if not id_card_col and not address_col:
++                raise ValueError("请先选择身份证列与地址列（可只选一个）")
++        else:
++            payload = request.get_json(silent=True) or {}
++            source = payload.get("source") or "students"
++            student_ids = payload.get("student_ids") or []
++            if source != "students":
++                raise ValueError("缺少上传文件或 source 参数")
++    except ValueError as exc:
++        _batch_lock.release()
++        return _fail(str(exc))
++
++    pid = _new_progress("batch")
++    created_by = session.get("username") or ""
++
++    def _target(app_obj, progress_id):
++        conn = district_model.get_db()
++        district_model.warm_cache(conn)
++        repo = district_model.DistrictRepository(conn)
++        if source != "upload":
++            students = repo.non_graduated_students(student_ids or None)
++            total = len(students)
++            batch_no = "B" + uuid.uuid4().hex[:8].upper()
++            batch_id = repo.create_batch(batch_no, "students", total, created_by)
++            _update_progress(progress_id, total=total, phase="匹配中")
++
++            def on_progress(done, all_count, stats):
++                _update_progress(progress_id, done=done, total=all_count,
++                                 message="正在匹配第 %d/%d 条" % (done, all_count))
++
++            try:
++                stats = runner.process_batch(repo, students, batch_id,
++                                             on_progress=on_progress,
++                                             source="students")
++                repo.update_batch(batch_id, status="done", total=total,
++                                  stats_json=json.dumps(stats, ensure_ascii=False))
++            except Exception:
++                repo.update_batch(batch_id, status="failed")
++                raise
++            _update_progress(progress_id, status="done", done=total, total=total,
++                             message="匹配完成", result={"batch_id": batch_id,
++                                                     "batch_no": batch_no,
++                                                     "stats": stats})
++            return
++
++        # 上传清单
++        rows = list(importer.iter_input_rows(staging, id_card_col, address_col))
++        total = len(rows)
++        batch_no = "B" + uuid.uuid4().hex[:8].upper()
++        batch_id = repo.create_batch(batch_no, "upload", total, created_by)
++        _update_progress(progress_id, total=total, phase="匹配中")
++
++        def on_progress(done, all_count, stats):
++            _update_progress(progress_id, done=done, total=all_count,
++                             message="正在匹配第 %d/%d 条" % (done, all_count))
++
++        students = [{"student_id": None, "student_name": "",
++                     "id_card": ic, "address": addr} for _n, ic, addr in rows]
++        stats = runner.process_batch(repo, students, batch_id,
++                                     on_progress=on_progress, source="upload")
++        repo.update_batch(batch_id, status="done", total=total,
++                          stats_json=json.dumps(stats, ensure_ascii=False))
++        _update_progress(progress_id, status="done", done=total, total=total,
++                         message="匹配完成",
++                         result={"batch_id": batch_id, "batch_no": batch_no,
++                                 "stats": stats})
++        try:
++            os.remove(staging)
++        except OSError:
++            pass
++
++    try:
++        _spawn(pid, _target)
++    except Exception:
++        _batch_lock.release()
++        raise
++
++    # 线程结束时释放批量锁（放在 _target 尾部会漏掉异常分支，用看门狗线程）
++    def _release_when_done():
++        while True:
++            time.sleep(0.5)
++            with _progress_lock:
++                item = _progress.get(pid)
++            if item and item.get("status") != "running":
++                break
++        _batch_lock.release()
++
++    threading.Thread(target=_release_when_done, daemon=True).start()
++    return _ok({"progress_id": pid, "total": 0})
++
++
++@bp.route("/api/district-match/progress/<progress_id>")
++def progress(progress_id):
++    err = _require_login_json()
++    if err:
++        return err
++    with _progress_lock:
++        item = _progress.get(progress_id)
++        item = dict(item) if item else None
++    if not item:
++        return _fail("任务已失效，请重新发起", 404)
++    return _ok(item)
++
++
++@bp.route("/api/district-match/batches")
++def batches():
++    err = _require_login_json()
++    if err:
++        return err
++    page_no = max(1, int(request.args.get("page") or 1))
++    size = min(100, max(1, int(request.args.get("size") or 20)))
++    repo = district_model.DistrictRepository()
++    items = repo.list_batches(limit=size, offset=(page_no - 1) * size)
++    for item in items:
++        if item.get("stats_json"):
++            try:
++                item["stats"] = json.loads(item["stats_json"])
++            except (TypeError, ValueError):
++                item["stats"] = {}
++    return _ok({"items": items, "total": repo.count_batches(), "page": page_no})
++
++
++@bp.route("/api/district-match/batches/<int:batch_id>/results")
++def results(batch_id):
++    err = _require_login_json()
++    if err:
++        return err
++    repo = district_model.DistrictRepository()
++    batch = repo.get_batch(batch_id=batch_id)
++    if not batch:
++        return _fail("批次不存在", 404)
++    page_no = max(1, int(request.args.get("page") or 1))
++    size = min(200, max(1, int(request.args.get("size") or 50)))
++    status = (request.args.get("status") or "").strip() or None
++    items = repo.list_results(batch_id, status=status, limit=size,
++                              offset=(page_no - 1) * size)
++    return _ok({
++        "batch": batch,
++        "items": items,
++        "total": repo.count_results(batch_id, status=status),
++        "stats": repo.result_stats(batch_id),
++        "page": page_no,
++    })
++
++
++@bp.route("/api/district-match/batches/<int:batch_id>/delete", methods=["POST"])
++def delete_batch(batch_id):
++    err = _require_admin_json()
++    if err:
++        return err
++    repo = district_model.DistrictRepository()
++    if not repo.get_batch(batch_id=batch_id):
++        return _fail("批次不存在", 404)
++    repo.soft_delete_batch(batch_id)
++    return _ok({"batch_id": batch_id})
++
++
++@bp.route("/api/district-match/batches/<int:batch_id>/export")
++def export_batch(batch_id):
++    err = _require_login_json()
++    if err:
++        return err
++    repo = district_model.DistrictRepository()
++    batch = repo.get_batch(batch_id=batch_id)
++    if not batch:
++        return _fail("批次不存在", 404)
++    fmt = (request.args.get("format") or "xlsx").lower()
++    if fmt not in ("xlsx", "csv"):
++        return _fail("仅支持 xlsx / csv")
++    rows = repo.list_results(batch_id, limit=100000, offset=0)
++    # 导出目录与 uploads 同级（即 _USER_DATA_DIR/exports），不引用 config 私有变量
++    out_dir = os.path.join(os.path.dirname(current_app.config["UPLOAD_FOLDER"]), "exports")
++    os.makedirs(out_dir, exist_ok=True)
++    out_path = os.path.join(out_dir,
++                            "district_match_%s.%s" % (batch.get("batch_no") or batch_id, fmt))
++    exporter.export_results(rows, out_path, fmt=fmt)
++    return send_file(out_path, as_attachment=True,
++                     download_name="区划匹配_%s.%s" % (batch.get("batch_no") or batch_id, fmt))
++
++
++# ------------------------------------------------------------------ 字典
++@bp.route("/api/district-match/dictionary")
++def dictionary():
++    err = _require_login_json()
++    if err:
++        return err
++    data = district_model.dictionary_status()
++    if request.args.get("verify") in ("1", "true"):
++        path = data["pack"]["path"]
++        if data["pack"]["exists"]:
++            ok, detail = pack_mod.verify_pack(path)
++            data["pack"]["verify_ok"] = ok
++            data["pack"]["sha256"] = detail.get("sha256")
++            data["pack"]["counts"] = {"total": detail.get("total"),
++                                      "by_level": detail.get("by_level")}
++        else:
++            data["pack"]["verify_ok"] = False
++    return _ok(data)
++
++
++@bp.route("/api/district-match/dictionary/import", methods=["POST"])
++def dictionary_import():
++    err = _require_admin_json()
++    if err:
++        return err
++    if not _import_lock.acquire(blocking=False):
++        return _fail("字典导入正在进行中，请稍后再试", 409)
++    pid = _new_progress("dict_import")
++    pack_file = district_model.pack_path()
++
++    def _target(app_obj, progress_id):
++        _update_progress(progress_id, phase="导入中", message="正在读取数据包...")
++        try:
++            result = district_model.import_dictionary(
++                pack_file,
++                on_progress=lambda n: _update_progress(progress_id, done=n,
++                                                       message="已导入 %d 条" % n))
++            _update_progress(progress_id, status="done", message="导入完成",
++                             result=result)
++        finally:
++            _import_lock.release()
++
++    try:
++        _spawn(pid, _target)
++    except Exception:
++        _import_lock.release()
++        raise
++    return _ok({"progress_id": pid, "pack": pack_file})
++
++
++@bp.route("/api/district-match/history")
++def history():
++    """历史映射只读列表（15.2 #6：本期不做增删改）。"""
++    err = _require_login_json()
++    if err:
++        return err
++    repo = district_model.DistrictRepository()
++    return _ok({"items": repo.list_history(), "readonly": True})
++
++
++# ------------------------------------------------------------------ 4.8.1 回填 / 重新匹配
++@bp.route("/api/district-match/backfill", methods=["POST"])
++def backfill():
++    err = _require_admin_json()
++    if err:
++        return err
++    if not _batch_lock.acquire(blocking=False):
++        return _fail("已有批量任务在执行，请稍后再试", 409)
++    payload = request.get_json(silent=True) or {}
++    only_empty = bool(payload.get("only_empty", True))
++    limit = min(5000, int(payload.get("limit") or 5000))
++    pid = _new_progress("backfill")
++
++    def _target(app_obj, progress_id):
++        _update_progress(progress_id, phase="回填中")
++        try:
++            result = district_model.backfill_students(
++                only_empty=only_empty, limit=limit,
++                on_progress=lambda done, total: _update_progress(
++                    progress_id, done=done, total=total,
++                    message="已处理 %d/%d 条" % (done, total)))
++            _update_progress(progress_id, status="done", message="回填完成",
++                             result=result)
++        finally:
++            _batch_lock.release()
++
++    try:
++        _spawn(pid, _target)
++    except Exception:
++        _batch_lock.release()
++        raise
++    return _ok({"progress_id": pid, "limit": limit, "only_empty": only_empty})
++
++
++@bp.route("/api/district-match/students/<int:student_id>/rematch", methods=["POST"])
++def rematch(student_id):
++    """编辑弹窗「重新匹配」：只写 dm_match_result，不回写 students。"""
++    err = _require_admin_json()
++    if err:
++        return err
++    try:
++        data = district_model.ensure_student_district(student_id, refresh=True)
++    except district_model.DistrictDbMissing:
++        return _fail("区划字典尚未导入，请先在“字典状态”中导入数据包", 409)
++    if data is None:
++        return _fail("学生不存在", 404)
++    return _ok(data)
++
++
++# ------------------------------------------------------------------ 编辑弹窗只读展示
++@bp.route("/api/district-match/students/<int:student_id>")
++def student_district(student_id):
++    err = _require_login_json()
++    if err:
++        return err
++    data = district_model.get_student_district(student_id=student_id)
++    return _ok({"district": data})
+diff --git a/config.py b/config.py
+index 01ace4d..7e68c7e 100644
+--- a/config.py
++++ b/config.py
+@@ -151,7 +151,9 @@ ALL_STUDENT_FIELDS = [
+     '入学年份',
+     '姓名拼音', '学平险保单号', '学平险缴费日期', '学平险到期时间',
+     '学平险保费金额', '实习险缴费日期', '主管标记', '申报日期',
+-    '保单更新日期', '学费总体情况'
++    '保单更新日期', '学费总体情况',
++    # 区划匹配 7 列：系统自动生成，不进导入模板（导入侧忽略用户填值）
++    '省', '省区划代码', '市', '市区划代码', '县', '县区划代码', '匹配状态'
+ ]
+ 
+ FIELD_MAPPING = {
+@@ -194,6 +196,14 @@ FIELD_MAPPING = {
+     '申报日期': 'declaration_date',
+     '保单更新日期': 'insurance_update_date',
+     '学费总体情况': 'tuition_status',
++    # 区划匹配 7 列（自动生成；导出引擎白名单由本映射派生）
++    '省': 'district_province_name',
++    '省区划代码': 'district_province_code',
++    '市': 'district_city_name',
++    '市区划代码': 'district_city_code',
++    '县': 'district_county_name',
++    '县区划代码': 'district_county_code',
++    '匹配状态': 'district_match_status',
+     '学校类别': 'school',
+ }
+ 
+diff --git a/data/district_pack.tsv.sha256 b/data/district_pack.tsv.sha256
+new file mode 100644
+index 0000000..a48a09c
+--- /dev/null
++++ b/data/district_pack.tsv.sha256
+@@ -0,0 +1,5 @@
++# district_pack.tsv.gz 校验信息（由 scripts/build_district_pack.py 生成）
++sha256  d1e60bbb0141da282410c618aefecddcb9d8962ab647c7b5ffabbac8451c05f4
++size    5411508
++total   664239
++levels  1:31 2:343 3:3255 4:41274 5:619336
+diff --git a/models/db.py b/models/db.py
+index e0dd0a6..38fd1e3 100644
+--- a/models/db.py
++++ b/models/db.py
+@@ -18,6 +18,110 @@ from config import DATABASE_PATH, PHOTOS_DIR
+ logger = logging.getLogger(__name__)
+ 
+ 
++# ============================================================
++# 区划字典（district.db）DDL —— 由 models.district.import_dictionary 执行
++# 该库独立于 student.db，不参与备份；运行期只读，仅导入时一次性写入
++# ============================================================
++DISTRICT_DDL = """
++CREATE TABLE IF NOT EXISTS dm_district_code (
++    district_code TEXT NOT NULL,
++    district_name TEXT NOT NULL,
++    admin_level   INTEGER NOT NULL,
++    parent_code   TEXT,
++    province_code TEXT,
++    city_code     TEXT,
++    PRIMARY KEY (district_code)
++) WITHOUT ROWID;
++CREATE INDEX IF NOT EXISTS idx_dm_district_name
++    ON dm_district_code (district_name, admin_level);
++CREATE INDEX IF NOT EXISTS idx_dm_district_parent
++    ON dm_district_code (parent_code);
++CREATE INDEX IF NOT EXISTS idx_dm_district_level
++    ON dm_district_code (admin_level);
++"""
++
++
++# ============================================================
++# 区划匹配业务表（student.db）—— 批次 / 结果 / 历史映射
++# 幂等：全部 CREATE TABLE IF NOT EXISTS
++# ============================================================
++DISTRICT_MATCH_DDL = """
++CREATE TABLE IF NOT EXISTS dm_match_batch (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    batch_no TEXT NOT NULL UNIQUE,
++    source TEXT DEFAULT 'batch',
++    total INTEGER DEFAULT 0,
++    status TEXT DEFAULT 'running',
++    stats_json TEXT DEFAULT '',
++    created_by TEXT DEFAULT '',
++    is_deleted INTEGER DEFAULT 0,
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++
++CREATE TABLE IF NOT EXISTS dm_match_result (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    batch_id INTEGER,
++    student_id INTEGER,
++    student_name TEXT,
++    id_card TEXT,
++    address TEXT,
++    province_code TEXT,
++    province_name TEXT,
++    city_code TEXT,
++    city_name TEXT,
++    district_code TEXT,
++    district_name TEXT,
++    match_status TEXT,
++    engine1_detail TEXT,
++    engine2_detail TEXT,
++    decision_path TEXT,
++    source TEXT DEFAULT 'batch',
++    is_deleted INTEGER DEFAULT 0,
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++
++CREATE INDEX IF NOT EXISTS idx_dm_result_batch
++    ON dm_match_result (batch_id);
++CREATE INDEX IF NOT EXISTS idx_dm_result_student
++    ON dm_match_result (student_id);
++CREATE INDEX IF NOT EXISTS idx_dm_result_id_card
++    ON dm_match_result (id_card);
++
++CREATE TABLE IF NOT EXISTS dm_history_mapping (
++    id INTEGER PRIMARY KEY AUTOINCREMENT,
++    old_code TEXT,
++    new_code TEXT,
++    old_name TEXT,
++    new_name TEXT,
++    change_type TEXT,
++    change_date TEXT,
++    remark TEXT,
++    is_deleted INTEGER DEFAULT 0,
++    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++"""
++
++# 历史区划映射内置种子（16 条）：仅当表为空时写入一次
++HISTORY_MAPPING_SEED = [
++    ("230105", "230104", "太平区", "道外区", "撤销合并", "2004", "太平区2004年并入道外区"),
++    ("231121", "231183", "嫩江县", "嫩江市", "撤县设市", "2019", "嫩江县2019年撤县设市"),
++    ("231024", "231086", "东宁县", "东宁市", "撤县设市", "2015", "东宁县2015年撤县设市"),
++    ("232723", "232701", "漠河县", "漠河市", "撤县设市", "2018", "漠河县2018年撤县设市"),
++    ("230182", "230113", "双城市", "双城区", "撤市设区", "2014", "双城市2014年撤市设区"),
++    ("210282", "210214", "普兰店市", "普兰店区", "撤市设区", "2015", "普兰店市2015年撤市设区"),
++    ("310230", "310151", "崇明县", "崇明区", "撤县设区", "2016", "崇明县2016年撤县设区"),
++    ("320584", "320509", "吴江市", "吴江区", "撤市设区", "2012", "吴江市2012年撤市设区"),
++    ("320124", "320117", "溧水县", "溧水区", "撤县设区", "2013", "溧水县2013年撤县设区"),
++    ("320125", "320118", "高淳县", "高淳区", "撤县设区", "2013", "高淳县2013年撤县设区"),
++    ("320323", "320312", "铜山县", "铜山区", "撤县设区", "2010", "铜山县2010年撤县设区"),
++    ("330621", "330603", "绍兴县", "柯桥区", "撤县设区", "2013", "绍兴县2013年撤县设区（柯桥区）"),
++    ("500227", "500120", "璧山县", "璧山区", "撤县设区", "2014", "璧山县2014年撤县设区"),
++    ("440183", "440118", "增城市", "增城区", "撤市设区", "2014", "增城市2014年撤市设区"),
++    ("320482", "320413", "金坛市", "金坛区", "撤市设区", "2015", "金坛市2015年撤市设区"),
++    ("321088", "321012", "江都市", "江都区", "撤市设区", "2011", "江都市2011年撤市设区"),
++]
++
++
+ # ============================================================
+ # 共享过滤函数：统一排除学籍状态为"毕业"的学生
+ # 所有业务查询（学生列表/搜索/统计/导出等）必须调用此函数
+@@ -160,6 +264,40 @@ def init_db():
+             cursor.execute(f'ALTER TABLE students ADD COLUMN {col_name} {col_def}')
+         except sqlite3.OperationalError:
+             pass
++
++    # ========== 区划匹配：students 7 列（只增列，不改其他字段）==========
++    # 代码列必须 TEXT（12 位、保留前导零），默认空串表示未匹配
++    district_columns = [
++        ('district_province_name', "TEXT DEFAULT ''"),
++        ('district_province_code', "TEXT DEFAULT ''"),
++        ('district_city_name', "TEXT DEFAULT ''"),
++        ('district_city_code', "TEXT DEFAULT ''"),
++        ('district_county_name', "TEXT DEFAULT ''"),
++        ('district_county_code', "TEXT DEFAULT ''"),
++        ('district_match_status', "TEXT DEFAULT ''"),
++    ]
++    for col_name, col_def in district_columns:
++        try:
++            cursor.execute(f'ALTER TABLE students ADD COLUMN {col_name} {col_def}')
++        except sqlite3.OperationalError:
++            pass
++
++    # ========== 区划匹配：批次 / 结果 / 历史映射表 ==========
++    for statement in DISTRICT_MATCH_DDL.split(';'):
++        if statement.strip():
++            cursor.execute(statement)
++
++    # 历史映射种子：仅当表为空时写入一次，之后以表内记录为准
++    try:
++        if cursor.execute('SELECT COUNT(1) FROM dm_history_mapping').fetchone()[0] == 0:
++            cursor.executemany(
++                'INSERT INTO dm_history_mapping '
++                '(old_code, new_code, old_name, new_name, change_type, change_date, remark) '
++                'VALUES (?, ?, ?, ?, ?, ?, ?)', HISTORY_MAPPING_SEED)
++    except sqlite3.OperationalError:
++        pass
++    # 立即提交种子事务，避免后续 migrate_* 新开连接时撞上写锁
++    conn.commit()
+     
+     cursor.execute('''
+         CREATE TABLE IF NOT EXISTS users (
+diff --git a/models/district.py b/models/district.py
+new file mode 100644
+index 0000000..cd26917
+--- /dev/null
++++ b/models/district.py
+@@ -0,0 +1,868 @@
++# -*- coding: utf-8 -*-
++"""区划字典 Repository、进程级缓存、录入联动与批次结果存取。
++
++设计约束（PORTING_GUIDE 0.2 / 3.3 / 4.6 / 7.1）：
++1. 只通过 models.db.get_db() 返回的连接 ATTACH 字典库，每请求只 ATTACH 一次；
++2. 运行期对 dm.* 只读；字典导入走一次性独立连接（唯一例外，见 0.2 #1b）；
++3. L1–L4 字典与历史映射缓存放进程级模块变量 + threading.Lock，绝不放 g；
++4. fill_district_fields 是纯内存补键函数：不写库、不 commit、不 UPDATE students，
++   事务边界留在 create_student / create_student_with_conn / update_student；
++5. 任何异常都不向调用方抛出（失败留空，状态置空），只记 warning 日志。
++"""
++import logging
++import os
++import sqlite3
++import threading
++import time
++
++from flask import g, has_app_context
++
++import config
++from models.db import get_db, _non_graduated_where
++from services.district_match import constants, runner
++from services.district_match import pack as pack_mod
++
++logger = logging.getLogger(__name__)
++
++# 字典库与数据包路径（0.2 #3：由 DATABASE_PATH 推导，禁用 config._USER_DATA_DIR）
++DISTRICT_DB_PATH = os.path.join(os.path.dirname(config.DATABASE_PATH),
++                                constants.DISTRICT_DB_FILENAME)
++_PACK_CANDIDATES = (
++    os.path.join(getattr(config, "BASE_DIR", os.path.dirname(__file__)),
++                 "data", constants.DISTRICT_PACK_FILENAME),
++    os.path.join(os.path.dirname(config.DATABASE_PATH),
++                 constants.DISTRICT_PACK_FILENAME),
++)
++
++DISTRICT_FIELDS = constants.DISTRICT_FIELDS
++
++
++class DistrictDbMissing(Exception):
++    """字典库缺失或未导入数据包。"""
++
++
++# ------------------------------------------------------------------ ATTACH
++def ensure_attached(conn=None):
++    """在当前请求连接上 ATTACH 字典库（每请求一次）。
++
++    init_db() 等无 app context 的场景直接返回传入连接，由调用方自行 ATTACH。
++    """
++    conn = conn or get_db()
++    if not os.path.exists(DISTRICT_DB_PATH):
++        raise DistrictDbMissing(f"字典库不存在：{DISTRICT_DB_PATH}")
++    if has_app_context() and getattr(g, "_dm_attached_conn", None) is conn:
++        return conn
++    try:
++        conn.execute("ATTACH DATABASE ? AS dm", (DISTRICT_DB_PATH,))
++    except sqlite3.OperationalError as exc:
++        msg = str(exc)
++        if "already in use" not in msg and "already attached" not in msg:
++            raise
++    if has_app_context():
++        g._dm_attached_conn = conn
++    return conn
++
++
++# ------------------------------------------------------------------ 缓存
++_CACHE_LOCK = threading.Lock()
++_CACHE = {
++    "ready": False,
++    "by_code": {},     # district_code -> row
++    "by_name": {},     # (district_name, admin_level) -> [row, ...]
++    "level_counts": {},
++    "loaded_at": 0.0,
++}
++
++_HISTORY_LOCK = threading.Lock()
++_HISTORY = {
++    "ready": False,
++    "alias": {},   # old_name -> new_name
++    "code": {},    # old_code -> new_code
++    "rows": [],
++}
++
++_DICT_STATE = {"ready": None, "at": 0.0, "total": 0}
++_DICT_LOCK = threading.Lock()
++_DICT_TTL = 5.0
++
++
++def _adapt(row):
++    """sqlite3.Row / tuple / dict -> 统一 dict。"""
++    if row is None:
++        return None
++    if isinstance(row, dict):
++        return dict(row)
++    try:
++        return {k: row[k] for k in row.keys()}
++    except AttributeError:
++        # 位置元组（仅用于字典 6 列查询）
++        return {
++            "district_code": row[0], "district_name": row[1],
++            "admin_level": row[2], "parent_code": row[3],
++            "province_code": row[4], "city_code": row[5],
++        }
++
++
++def _adapt_district(row):
++    """字典行适配：补 id/pid 别名（兼容原引擎对 id / pid 的依赖）。"""
++    item = _adapt(row)
++    if item and "district_code" in item:
++        item["id"] = item["district_code"]
++        item["pid"] = item.get("parent_code")
++    return item
++
++
++def _normalize_code(code):
++    """统一 12 位文本代码：只保留数字并右补 0，保留前导零。"""
++    if code is None:
++        return ""
++    text = str(code).strip()
++    if not text:
++        return ""
++    if not text.isdigit():
++        return ""
++    return (text + "0" * 12)[:12]
++
++
++def _dict_ready(conn, refresh=False):
++    """字典表是否可用（5 秒内复用结果，避免逐行探测）。"""
++    now = time.time()
++    with _DICT_LOCK:
++        if not refresh and _DICT_STATE["ready"] is not None \
++                and now - _DICT_STATE["at"] < _DICT_TTL:
++            return _DICT_STATE["ready"]
++    ok = False
++    total = 0
++    try:
++        ensure_attached(conn)
++        row = conn.execute(
++            "SELECT name FROM dm.sqlite_master WHERE type='table' "
++            "AND name='dm_district_code'").fetchone()
++        if row:
++            cnt = conn.execute("SELECT COUNT(1) FROM dm.dm_district_code").fetchone()
++            total = int(cnt[0]) if cnt else 0
++            ok = total > 0
++    except Exception as exc:  # 字典缺失不阻断业务
++        logger.debug("区划字典不可用：%s", exc)
++        ok = False
++    with _DICT_LOCK:
++        _DICT_STATE.update({"ready": ok, "at": time.time(), "total": total})
++    return ok
++
++
++def _load_cache(conn):
++    """加载 L1–L4 常驻缓存（进程级，只加载一次）。"""
++    if _CACHE["ready"]:
++        return _CACHE
++    with _CACHE_LOCK:
++        if _CACHE["ready"]:
++            return _CACHE
++        started = time.time()
++        ensure_attached(conn)
++        rows = conn.execute(
++            "SELECT district_code, district_name, admin_level, parent_code, "
++            "province_code, city_code FROM dm.dm_district_code "
++            "WHERE admin_level <= ?", (constants.CACHE_MAX_LEVEL,)).fetchall()
++        by_code = {}
++        by_name = {}
++        counts = {}
++        for raw in rows:
++            item = _adapt_district(raw)
++            by_code[item["district_code"]] = item
++            by_name.setdefault((item["district_name"], item["admin_level"]), []).append(item)
++            counts[item["admin_level"]] = counts.get(item["admin_level"], 0) + 1
++        _CACHE.update({
++            "ready": True,
++            "by_code": by_code,
++            "by_name": by_name,
++            "level_counts": counts,
++            "loaded_at": time.time(),
++        })
++        logger.info("区划字典缓存加载完成：%s 行，耗时 %.2fs",
++                    len(by_code), time.time() - started)
++        return _CACHE
++
++
++def _load_history(conn):
++    """加载历史映射缓存（dm_history_mapping 在 student.db）。"""
++    if _HISTORY["ready"]:
++        return _HISTORY
++    with _HISTORY_LOCK:
++        if _HISTORY["ready"]:
++            return _HISTORY
++        alias, code_map, rows = {}, {}, []
++        try:
++            cur = conn.execute(
++                "SELECT old_code, new_code, old_name, new_name, change_type, "
++                "change_date, remark FROM dm_history_mapping "
++                "WHERE is_deleted = 0 ORDER BY id")
++            for raw in cur.fetchall():
++                # 直接按下标取，避免依赖 Row 的键名
++                vals = list(raw)
++                old_code, new_code = vals[0], vals[1]
++                old_name, new_name = vals[2], vals[3]
++                rows.append({
++                    "old_code": old_code, "new_code": new_code,
++                    "old_name": old_name, "new_name": new_name,
++                    "change_type": vals[4], "change_date": vals[5],
++                    "remark": vals[6],
++                })
++                if old_name and new_name:
++                    alias[old_name] = new_name
++                if old_code and new_code:
++                    code_map[str(old_code)] = str(new_code)
++        except sqlite3.OperationalError as exc:
++            logger.warning("历史映射表不可用（按空处理）：%s", exc)
++        _HISTORY.update({"ready": True, "alias": alias, "code": code_map, "rows": rows})
++        return _HISTORY
++
++
++def invalidate_cache():
++    """字典重导/历史变更后清空缓存（进程级）。"""
++    with _CACHE_LOCK:
++        _CACHE.update({"ready": False, "by_code": {}, "by_name": {},
++                       "level_counts": {}, "loaded_at": 0.0})
++    with _HISTORY_LOCK:
++        _HISTORY.update({"ready": False, "alias": {}, "code": {}, "rows": []})
++    with _DICT_LOCK:
++        _DICT_STATE.update({"ready": None, "at": 0.0, "total": 0})
++
++
++def warm_cache(conn=None):
++    """显式预热（批量导入前调用），返回缓存信息；字典缺失时返回 ready=False。"""
++    conn = conn or get_db()
++    try:
++        if not _dict_ready(conn, refresh=True):
++            return {"ready": False}
++        _load_cache(conn)
++        _load_history(conn)
++        return cache_info()
++    except Exception as exc:
++        logger.warning("区划缓存预热失败：%s", exc)
++        return {"ready": False, "error": str(exc)}
++
++
++def cache_info():
++    """缓存状态（不含大对象）。"""
++    return {
++        "ready": bool(_CACHE["ready"]),
++        "rows": len(_CACHE["by_code"]),
++        "level_counts": dict(_CACHE["level_counts"]),
++        "loaded_at": _CACHE["loaded_at"],
++        "history_ready": bool(_HISTORY["ready"]),
++        "history_rows": len(_HISTORY["rows"]),
++    }
++
++
++# ------------------------------------------------------------------ Repository
++class DistrictRepository:
++    """字典 + 批次/结果的数据访问对象。
++
++    引擎只依赖鸭子类型方法：get_by_district_code / get_by_id / reverse_lookup /
++    search_by_name / get_history_alias_map / get_history_code_map。
++    """
++
++    def __init__(self, conn=None):
++        self._conn = conn
++        self._attached = False
++
++    @property
++    def conn(self):
++        if self._conn is None:
++            self._conn = get_db()
++        return self._conn
++
++    def _ensure(self):
++        if not self._attached:
++            ensure_attached(self.conn)
++            self._attached = True
++
++    # ---------------- 字典只读
++    def get_by_district_code(self, code, level=None):
++        code = _normalize_code(code)
++        if not code:
++            return None
++        cache = _CACHE
++        if cache["ready"] and (level is None or level <= constants.CACHE_MAX_LEVEL):
++            hit = cache["by_code"].get(code)
++            if hit and (level is None or hit["admin_level"] == level):
++                return hit
++        try:
++            self._ensure()
++            if level is None:
++                row = self.conn.execute(
++                    "SELECT district_code, district_name, admin_level, parent_code, "
++                    "province_code, city_code FROM dm.dm_district_code "
++                    "WHERE district_code = ? ORDER BY admin_level LIMIT 1", (code,)).fetchone()
++            else:
++                row = self.conn.execute(
++                    "SELECT district_code, district_name, admin_level, parent_code, "
++                    "province_code, city_code FROM dm.dm_district_code "
++                    "WHERE district_code = ? AND admin_level = ?", (code, level)).fetchone()
++            return _adapt_district(row)
++        except Exception as exc:
++            logger.debug("区划按代码查询失败：%s", exc)
++            return None
++
++    def get_by_id(self, rid):
++        """引擎内的 pid 是 12 位代码，等价于按代码查询。"""
++        if rid is None:
++            return None
++        return self.get_by_district_code(str(rid))
++
++    def reverse_lookup(self, name, level, pid=None):
++        """按名称反查（level<=4 走缓存，level=5 走 SQL）。"""
++        if not name:
++            return None
++        if level <= constants.CACHE_MAX_LEVEL:
++            _load_cache(self.conn)
++            items = _CACHE["by_name"].get((name, level)) or []
++            if pid:
++                for item in items:
++                    if item.get("parent_code") == str(pid) or item.get("pid") == str(pid):
++                        return item
++                return None
++            return items[0] if items else None
++        try:
++            self._ensure()
++            if pid:
++                row = self.conn.execute(
++                    "SELECT district_code, district_name, admin_level, parent_code, "
++                    "province_code, city_code FROM dm.dm_district_code "
++                    "WHERE district_name = ? AND admin_level = ? AND parent_code = ? LIMIT 1",
++                    (name, level, str(pid))).fetchone()
++                if row:
++                    return _adapt_district(row)
++            row = self.conn.execute(
++                "SELECT district_code, district_name, admin_level, parent_code, "
++                "province_code, city_code FROM dm.dm_district_code "
++                "WHERE district_name = ? AND admin_level = ? LIMIT 1",
++                (name, level)).fetchone()
++            return _adapt_district(row)
++        except Exception as exc:
++            logger.debug("区划按名称反查失败：%s", exc)
++            return None
++
++    def search_by_name(self, name, level=None):
++        """按名称搜索（可能多条；level=None 时全层级）。"""
++        if not name:
++            return []
++        if level is not None and level <= constants.CACHE_MAX_LEVEL:
++            _load_cache(self.conn)
++            return list(_CACHE["by_name"].get((name, level)) or [])
++        try:
++            self._ensure()
++            if level is None:
++                cur = self.conn.execute(
++                    "SELECT district_code, district_name, admin_level, parent_code, "
++                    "province_code, city_code FROM dm.dm_district_code "
++                    "WHERE district_name = ? ORDER BY admin_level, district_code", (name,))
++            else:
++                cur = self.conn.execute(
++                    "SELECT district_code, district_name, admin_level, parent_code, "
++                    "province_code, city_code FROM dm.dm_district_code "
++                    "WHERE district_name = ? AND admin_level = ? ORDER BY district_code",
++                    (name, level))
++            return [_adapt_district(r) for r in cur.fetchall()]
++        except Exception as exc:
++            logger.debug("区划名称搜索失败：%s", exc)
++            return []
++
++    def query_levels_le(self, level=constants.CACHE_MAX_LEVEL):
++        """取 <= level 的全部字典行（缓存优先）。"""
++        if level <= constants.CACHE_MAX_LEVEL:
++            _load_cache(self.conn)
++            return list(_CACHE["by_code"].values())
++        try:
++            self._ensure()
++            cur = self.conn.execute(
++                "SELECT district_code, district_name, admin_level, parent_code, "
++                "province_code, city_code FROM dm.dm_district_code "
++                "WHERE admin_level <= ? ORDER BY admin_level, district_code", (level,))
++            return [_adapt_district(r) for r in cur.fetchall()]
++        except Exception:
++            return []
++
++    def get_history_alias_map(self):
++        return dict(_load_history(self.conn)["alias"])
++
++    def get_history_code_map(self):
++        return dict(_load_history(self.conn)["code"])
++
++    def list_history(self):
++        _load_history(self.conn)
++        return list(_HISTORY["rows"])
++
++    def district_stats(self):
++        """字典统计：总行数、各级行数、更新时间、文件大小。"""
++        stats = {
++            "db_path": DISTRICT_DB_PATH,
++            "db_exists": os.path.exists(DISTRICT_DB_PATH),
++            "db_size": 0,
++            "total": 0,
++            "by_level": {},
++            "updated_at": "",
++            "cache": cache_info(),
++        }
++        if not stats["db_exists"]:
++            return stats
++        stats["db_size"] = os.path.getsize(DISTRICT_DB_PATH)
++        stats["updated_at"] = time.strftime(
++            "%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(DISTRICT_DB_PATH)))
++        try:
++            if not _dict_ready(self.conn, refresh=True):
++                return stats
++            cur = self.conn.execute(
++                "SELECT admin_level, COUNT(1) FROM dm.dm_district_code "
++                "GROUP BY admin_level ORDER BY admin_level")
++            by_level = {}
++            total = 0
++            for level, cnt in cur.fetchall():
++                by_level[int(level)] = int(cnt)
++                total += int(cnt)
++            stats["by_level"] = by_level
++            stats["total"] = total
++        except Exception as exc:
++            logger.debug("字典统计失败：%s", exc)
++        return stats
++
++    # ---------------- 批次 / 结果（dm_* 在 student.db，可写）
++    def create_batch(self, batch_no, source, total, created_by):
++        self.conn.execute(
++            "INSERT INTO dm_match_batch (batch_no, source, total, status, created_by) "
++            "VALUES (?,?,?, 'running', ?)", (batch_no, source, total, created_by))
++        self.conn.commit()
++        row = self.conn.execute(
++            "SELECT id FROM dm_match_batch WHERE batch_no = ?", (batch_no,)).fetchone()
++        return int(row[0]) if row else None
++
++    def update_batch(self, batch_id, status=None, total=None, stats_json=None):
++        fields, args = [], []
++        if status is not None:
++            fields.append("status = ?")
++            args.append(status)
++        if total is not None:
++            fields.append("total = ?")
++            args.append(int(total))
++        if stats_json is not None:
++            fields.append("stats_json = ?")
++            args.append(stats_json)
++        if not fields:
++            return
++        args.append(batch_id)
++        self.conn.execute(
++            f"UPDATE dm_match_batch SET {', '.join(fields)} WHERE id = ?", args)
++        self.conn.commit()
++
++    def get_batch(self, batch_id=None, batch_no=None):
++        if batch_id:
++            row = self.conn.execute(
++                "SELECT * FROM dm_match_batch WHERE id = ? AND is_deleted = 0",
++                (batch_id,)).fetchone()
++        else:
++            row = self.conn.execute(
++                "SELECT * FROM dm_match_batch WHERE batch_no = ? AND is_deleted = 0",
++                (batch_no,)).fetchone()
++        return _adapt(row)
++
++    def list_batches(self, limit=50, offset=0):
++        cur = self.conn.execute(
++            "SELECT * FROM dm_match_batch WHERE is_deleted = 0 "
++            "ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
++        return [_adapt(r) for r in cur.fetchall()]
++
++    def count_batches(self):
++        row = self.conn.execute(
++            "SELECT COUNT(1) FROM dm_match_batch WHERE is_deleted = 0").fetchone()
++        return int(row[0]) if row else 0
++
++    def soft_delete_batch(self, batch_id):
++        self.conn.execute(
++            "UPDATE dm_match_batch SET is_deleted = 1 WHERE id = ?", (batch_id,))
++        self.conn.execute(
++            "UPDATE dm_match_result SET is_deleted = 1 WHERE batch_id = ?", (batch_id,))
++        self.conn.commit()
++
++    def delete_results_by_batch(self, batch_id):
++        self.conn.execute(
++            "DELETE FROM dm_match_result WHERE batch_id = ?", (batch_id,))
++        self.conn.commit()
++
++    def insert_results_batch(self, rows, chunk=500):
++        if not rows:
++            return 0
++        sql = ("INSERT INTO dm_match_result "
++               "(batch_id, student_id, student_name, id_card, address, "
++               " province_code, province_name, city_code, city_name, "
++               " district_code, district_name, match_status, engine1_detail, "
++               " engine2_detail, decision_path, source) "
++               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
++        values = [
++            (r.get("batch_id"), r.get("student_id"), r.get("student_name"),
++             r.get("id_card"), r.get("address"),
++             r.get("province_code"), r.get("province_name"),
++             r.get("city_code"), r.get("city_name"),
++             r.get("district_code"), r.get("district_name"),
++             r.get("match_status"), r.get("engine1_result") or r.get("engine1_detail"),
++             r.get("engine2_result") or r.get("engine2_detail"),
++             r.get("remark") or r.get("decision_path"),
++             r.get("source") or "batch")
++            for r in rows
++        ]
++        for i in range(0, len(values), chunk):
++            self.conn.executemany(sql, values[i:i + chunk])
++        self.conn.commit()
++        return len(values)
++
++    def list_results(self, batch_id, status=None, limit=200, offset=0):
++        sql = ("SELECT * FROM dm_match_result WHERE batch_id = ? AND is_deleted = 0")
++        args = [batch_id]
++        if status:
++            sql += " AND match_status = ?"
++            args.append(status)
++        sql += " ORDER BY id LIMIT ? OFFSET ?"
++        args.extend([limit, offset])
++        cur = self.conn.execute(sql, args)
++        return [_adapt(r) for r in cur.fetchall()]
++
++    def count_results(self, batch_id, status=None):
++        sql = "SELECT COUNT(1) FROM dm_match_result WHERE batch_id = ? AND is_deleted = 0"
++        args = [batch_id]
++        if status:
++            sql += " AND match_status = ?"
++            args.append(status)
++        row = self.conn.execute(sql, args).fetchone()
++        return int(row[0]) if row else 0
++
++    def result_stats(self, batch_id):
++        cur = self.conn.execute(
++            "SELECT match_status, COUNT(1) FROM dm_match_result "
++            "WHERE batch_id = ? AND is_deleted = 0 GROUP BY match_status", (batch_id,))
++        data = {status: int(cnt) for status, cnt in cur.fetchall()}
++        data["总计"] = sum(data.values())
++        return data
++
++    # ---------------- 学生口径查询（只读 students）
++    def get_student(self, student_id):
++        row = self.conn.execute(
++            "SELECT id, name, id_card, address, district_province_name, "
++            "district_province_code, district_city_name, district_city_code, "
++            "district_county_name, district_county_code, district_match_status "
++            "FROM students WHERE id = ?", (student_id,)).fetchone()
++        return _adapt(row)
++
++    def latest_result_for_student(self, student_id=None, id_card=None):
++        if student_id:
++            row = self.conn.execute(
++                "SELECT * FROM dm_match_result WHERE student_id = ? AND is_deleted = 0 "
++                "ORDER BY id DESC LIMIT 1", (student_id,)).fetchone()
++            if row:
++                return _adapt(row)
++        if id_card:
++            row = self.conn.execute(
++                "SELECT * FROM dm_match_result WHERE id_card = ? AND is_deleted = 0 "
++                "ORDER BY id DESC LIMIT 1", (id_card,)).fetchone()
++            return _adapt(row)
++        return None
++
++    def insert_single_result(self, row):
++        return self.insert_results_batch([row])
++
++    def non_graduated_students(self, student_ids=None):
++        sql = ("SELECT id AS student_id, name AS student_name, id_card, address "
++               "FROM students WHERE " + _non_graduated_where())
++        args = []
++        if student_ids:
++            placeholders = ",".join("?" for _ in student_ids)
++            sql += f" AND id IN ({placeholders})"
++            args.extend(student_ids)
++        sql += " ORDER BY id"
++        cur = self.conn.execute(sql, args)
++        return [_adapt(r) for r in cur.fetchall()]
++
++
++# ------------------------------------------------------------------ 录入联动
++def _blank(data):
++    for key in DISTRICT_FIELDS:
++        data.setdefault(key, "")
++    return data
++
++
++def fill_district_fields(data, conn=None):
++    """就地补 students 的 7 个区划键，返回原 data。
++
++    - 纯内存：不执行写 SQL、不 commit、不 UPDATE students；
++    - 字典缺失/任何异常：7 键留空，绝不抛异常；
++    - 事务边界由 create_student / create_student_with_conn / update_student 控制。
++    """
++    if data is None:
++        return data
++    try:
++        _blank(data)
++        if not data.get("id_card") and not data.get("address"):
++            return data
++        repo = DistrictRepository(conn)
++        if not _dict_ready(repo.conn):
++            return data
++        _load_cache(repo.conn)
++        _load_history(repo.conn)
++        result = runner.run_match(repo, data.get("id_card"), data.get("address"))
++        data.update(runner.to_district_fields(result))
++    except Exception as exc:
++        logger.warning("区划自动补全失败（已留空）：%s", exc)
++        _blank(data)
++    return data
++
++
++def fill_district_fields_many(rows, conn=None):
++    """批量补 7 键（>500 行导入用）：一次 ATTACH、一次预热、循环内存匹配。
++
++    返回 rows 本身（就地修改），便于调用方继续插入。
++    """
++    rows = list(rows or [])
++    if not rows:
++        return rows
++    try:
++        repo = DistrictRepository(conn)
++        if not _dict_ready(repo.conn):
++            for data in rows:
++                _blank(data)
++            return rows
++        _load_cache(repo.conn)
++        _load_history(repo.conn)
++        for data in rows:
++            if data is None:
++                continue
++            _blank(data)
++            if not data.get("id_card") and not data.get("address"):
++                continue
++            try:
++                result = runner.run_match(repo, data.get("id_card"), data.get("address"))
++                data.update(runner.to_district_fields(result))
++            except Exception as exc:
++                logger.warning("区划批量补全单行失败（已留空）：%s", exc)
++                _blank(data)
++    except Exception as exc:
++        logger.warning("区划批量补全失败（已留空）：%s", exc)
++        for data in rows:
++            if data is not None:
++                _blank(data)
++    return rows
++
++
++# ------------------------------------------------------------------ 4.9 三接口
++def get_student_district(student_id=None, id_card=None):
++    """先取 students 7 列；为空再取最新有效匹配结果；仍无返回 None。"""
++    repo = DistrictRepository()
++    student = None
++    if student_id:
++        student = repo.get_student(student_id)
++    elif id_card:
++        row = repo.conn.execute(
++            "SELECT id, name, id_card, address, district_province_name, "
++            "district_province_code, district_city_name, district_city_code, "
++            "district_county_name, district_county_code, district_match_status "
++            "FROM students WHERE id_card = ? AND is_deleted = 0 "
++            "ORDER BY id DESC LIMIT 1", (id_card,)).fetchone()
++        student = _adapt(row)
++
++    if student and student.get("district_county_code"):
++        return {
++            "district_province_name": student.get("district_province_name") or "",
++            "district_province_code": student.get("district_province_code") or "",
++            "district_city_name": student.get("district_city_name") or "",
++            "district_city_code": student.get("district_city_code") or "",
++            "district_county_name": student.get("district_county_name") or "",
++            "district_county_code": student.get("district_county_code") or "",
++            "match_status": student.get("district_match_status") or "",
++            "batch_id": None,
++            "created_at": None,
++            "source": "students",
++        }
++
++    latest = repo.latest_result_for_student(
++        student_id=student_id,
++        id_card=(student or {}).get("id_card") or id_card)
++    if not latest:
++        return None
++    return {
++        "district_province_name": latest.get("province_name") or "",
++        "district_province_code": latest.get("province_code") or "",
++        "district_city_name": latest.get("city_name") or "",
++        "district_city_code": latest.get("city_code") or "",
++        "district_county_name": latest.get("district_name") or "",
++        "district_county_code": latest.get("district_code") or "",
++        "match_status": latest.get("match_status") or "",
++        "batch_id": latest.get("batch_id"),
++        "created_at": latest.get("created_at"),
++        "source": "dm_match_result",
++    }
++
++
++def ensure_student_district(student_id, refresh=False):
++    """按需匹配：只写 dm_match_result（source='on_demand'），绝不回写 students。"""
++    repo = DistrictRepository()
++    if not refresh:
++        existed = get_student_district(student_id=student_id)
++        if existed:
++            return existed
++    student = repo.get_student(student_id)
++    if not student:
++        return None
++    result = runner.run_match(repo, student.get("id_card"), student.get("address"),
++                              with_detail=True)
++    row = runner.to_result_row({
++        "student_id": student_id,
++        "student_name": student.get("name"),
++        "id_card": student.get("id_card"),
++        "address": student.get("address"),
++    }, result)
++    row["batch_id"] = None
++    row["source"] = "on_demand"
++    repo.insert_single_result(row)
++    return {
++        "district_province_name": result.province_name or "",
++        "district_province_code": result.province_code or "",
++        "district_city_name": result.city_name or "",
++        "district_city_code": result.city_code or "",
++        "district_county_name": result.district_name or "",
++        "district_county_code": result.district_code or "",
++        "match_status": result.match_status or "",
++        "batch_id": None,
++        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
++        "source": "on_demand",
++    }
++
++
++def match_students(student_ids=None, created_by="", on_progress=None):
++    """学生口径批量匹配：只写 dm_match_result，不写 students。
++
++    学生范围复用 models.db._non_graduated_where()（排除毕业与软删除）。
++    """
++    repo = DistrictRepository()
++    students = repo.non_graduated_students(student_ids)
++    batch_no = "B" + os.urandom(4).hex()
++    batch_id = repo.create_batch(batch_no, "students", len(students), created_by)
++    try:
++        stats = runner.process_batch(repo, students, batch_id, on_progress=on_progress,
++                                     source="students")
++        repo.update_batch(batch_id, status="done", total=len(students),
++                          stats_json=_json(stats))
++    except Exception:
++        repo.update_batch(batch_id, status="failed")
++        raise
++    return {"batch_id": batch_id, "batch_no": batch_no, "stats": stats}
++
++
++def _json(obj):
++    import json
++    return json.dumps(obj, ensure_ascii=False)
++
++
++# ------------------------------------------------------------------ 写 students（唯一批量入口）
++def backfill_students(only_empty=True, limit=None, on_progress=None):
++    """批量补全区划：只 UPDATE 7 列，不动 updated_at，不写 other 列。
++
++    only_empty=True 时只处理区县代码为空的学生。
++    """
++    conn = get_db()
++    sql = ("SELECT id, id_card, address FROM students "
++           "WHERE is_deleted = 0")
++    if only_empty:
++        sql += " AND (district_county_code IS NULL OR district_county_code = '')"
++    sql += " ORDER BY id"
++    if limit:
++        sql += f" LIMIT {int(limit)}"
++    rows = [_adapt(r) for r in conn.execute(sql).fetchall()]
++    total = len(rows)
++    updated = 0
++    failed = 0
++    chunk = []
++    for i, row in enumerate(rows, start=1):
++        try:
++            fields = fill_district_fields({"id_card": row.get("id_card"),
++                                           "address": row.get("address")}, conn)
++            chunk.append((
++                fields.get("district_province_name", ""),
++                fields.get("district_province_code", ""),
++                fields.get("district_city_name", ""),
++                fields.get("district_city_code", ""),
++                fields.get("district_county_name", ""),
++                fields.get("district_county_code", ""),
++                fields.get("district_match_status", ""),
++                row["id"],
++            ))
++        except Exception as exc:
++            failed += 1
++            logger.warning("学生 %s 区划补全失败：%s", row.get("id"), exc)
++        if len(chunk) >= 200:
++            conn.executemany(
++                "UPDATE students SET district_province_name = ?, "
++                "district_province_code = ?, district_city_name = ?, "
++                "district_city_code = ?, district_county_name = ?, "
++                "district_county_code = ?, district_match_status = ? "
++                "WHERE id = ?", chunk)
++            conn.commit()
++            updated += len(chunk)
++            chunk.clear()
++        if on_progress and i % 200 == 0:
++            on_progress(i, total)
++    if chunk:
++        conn.executemany(
++            "UPDATE students SET district_province_name = ?, "
++            "district_province_code = ?, district_city_name = ?, "
++            "district_city_code = ?, district_county_name = ?, "
++            "district_county_code = ?, district_match_status = ? "
++            "WHERE id = ?", chunk)
++        conn.commit()
++        updated += len(chunk)
++    if on_progress:
++        on_progress(total, total)
++    return {"total": total, "updated": updated, "failed": failed}
++
++
++# ------------------------------------------------------------------ 字典导入 / 状态
++def pack_path():
++    for path in _PACK_CANDIDATES:
++        if os.path.exists(path):
++            return path
++    return _PACK_CANDIDATES[0]
++
++
++def dictionary_status():
++    """字典状态 + 数据包校验（不含 sha256 计算，由接口按需触发）。"""
++    stats = DistrictRepository().district_stats()
++    path = pack_path()
++    stats["pack"] = {
++        "path": path,
++        "exists": os.path.exists(path),
++        "size": os.path.getsize(path) if os.path.exists(path) else 0,
++    }
++    return stats
++
++
++def import_dictionary(pack_file=None, on_progress=None):
++    """导入字典数据包。
++
++    使用一次性独立连接（0.2 #1b 唯一例外），避免长连接/连接池；
++    导入完成后清缓存，下一次请求重新 ATTACH 新库。
++    """
++    from models.db import DISTRICT_DDL
++
++    path = pack_file or pack_path()
++    if not os.path.exists(path):
++        raise FileNotFoundError(f"数据包不存在：{path}")
++
++    os.makedirs(os.path.dirname(DISTRICT_DB_PATH), exist_ok=True)
++    conn = sqlite3.connect(DISTRICT_DB_PATH, timeout=30)
++    try:
++        conn.isolation_level = None
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("PRAGMA synchronous=NORMAL")
++        from services.district_match import importer
++        result = importer.import_pack(conn, path, schema_sql=DISTRICT_DDL,
++                                      on_progress=on_progress)
++    finally:
++        conn.close()
++    invalidate_cache()
++    return result
+diff --git a/models/students.py b/models/students.py
+index ba52108..51dd4d1 100644
+--- a/models/students.py
++++ b/models/students.py
+@@ -3,6 +3,7 @@ import re
+ import logging
+ from datetime import datetime, timedelta
+ from models.db import get_db, _exclude_graduated_clause
++from models.district import fill_district_fields, DISTRICT_FIELDS
+ from models.logs import update_sync_timestamp
+ from models.school_types import get_school_type_map
+ 
+@@ -38,7 +39,10 @@ def create_student(student_data):
+             existing = get_student_by_id_card(id_card)
+             if existing:
+                 raise ValueError(f'身份证号 {id_card} 已存在')
+-        
++
++        # 区划联动：就地补 7 键（纯内存、不抛异常；事务仍由本函数控制）
++        fill_district_fields(student_data, conn)
++
+         cursor.execute('''
+             INSERT INTO students (student_no, national_no, id_card, name, gender, birth_date,
+                                   ethnicity, address, major, admin_class, virtual_class,
+@@ -47,9 +51,12 @@ def create_student(student_data):
+                                   issue_authority, valid_start, valid_end, major_direction,
+                                   household_type, junior_school, admission_type,
+                                   junior_graduation_time, change_info, remark, enrollment_year,
+-                                  name_pinyin, created_at)
++                                  name_pinyin, district_province_name, district_province_code,
++                                  district_city_name, district_city_code, district_county_name,
++                                  district_county_code, district_match_status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
++                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
++                    datetime('now', 'localtime'))
+         ''', (
+             student_no,
+             national_no,
+@@ -81,7 +88,14 @@ def create_student(student_data):
+             _to_null_if_empty(student_data.get('change_info')),
+             _to_null_if_empty(student_data.get('remark')),
+             student_data.get('enrollment_year', 0),
+-            student_data.get('name_pinyin', '')
++            student_data.get('name_pinyin', ''),
++            student_data.get('district_province_name', ''),
++            student_data.get('district_province_code', ''),
++            student_data.get('district_city_name', ''),
++            student_data.get('district_city_code', ''),
++            student_data.get('district_county_name', ''),
++            student_data.get('district_county_code', ''),
++            student_data.get('district_match_status', '')
+         ))
+         conn.commit()
+         update_sync_timestamp()
+@@ -126,6 +140,9 @@ def create_student_with_conn(conn, student_data):
+             if cursor.fetchone():
+                 raise ValueError(f'身份证号 {id_card} 已存在')
+ 
++        # 区划联动：批量导入逐行补 7 键（>500 行请改用 fill_district_fields_many）
++        fill_district_fields(student_data, conn)
++
+         cursor.execute('''
+             INSERT INTO students (student_no, national_no, id_card, name, gender, birth_date,
+                                   ethnicity, address, major, admin_class, virtual_class,
+@@ -134,9 +151,12 @@ def create_student_with_conn(conn, student_data):
+                                   issue_authority, valid_start, valid_end, major_direction,
+                                   household_type, junior_school, admission_type,
+                                   junior_graduation_time, change_info, remark, enrollment_year,
+-                                  name_pinyin, created_at)
++                                  name_pinyin, district_province_name, district_province_code,
++                                  district_city_name, district_city_code, district_county_name,
++                                  district_county_code, district_match_status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
++                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
++                    datetime('now', 'localtime'))
+         ''', (
+             student_no,
+             national_no,
+@@ -168,7 +188,14 @@ def create_student_with_conn(conn, student_data):
+             _to_null_if_empty(student_data.get('change_info')),
+             _to_null_if_empty(student_data.get('remark')),
+             student_data.get('enrollment_year', 0),
+-            student_data.get('name_pinyin', '')
++            student_data.get('name_pinyin', ''),
++            student_data.get('district_province_name', ''),
++            student_data.get('district_province_code', ''),
++            student_data.get('district_city_name', ''),
++            student_data.get('district_city_code', ''),
++            student_data.get('district_county_name', ''),
++            student_data.get('district_county_code', ''),
++            student_data.get('district_match_status', '')
+         ))
+         return cursor.lastrowid
+     except ValueError:
+@@ -282,7 +309,28 @@ def update_student(student_id, student_data):
+             existing = get_student_by_id_card(id_card)
+             if existing and existing.get('id') != student_id:
+                 raise ValueError(f'身份证号 {id_card} 已存在')
+-        
++
++        # 区划联动：仅当身份证/地址发生变化时重算 7 列（失败留空，不阻断更新）
++        try:
++            current = get_student_by_id(student_id) or {}
++            id_changed = ('id_card' in student_data and
++                          _to_null_if_empty(student_data.get('id_card'))
++                          != _to_null_if_empty(current.get('id_card')))
++            addr_changed = ('address' in student_data and
++                            _to_null_if_empty(student_data.get('address'))
++                            != _to_null_if_empty(current.get('address')))
++            if id_changed or addr_changed:
++                source = {
++                    'id_card': student_data.get('id_card', current.get('id_card')),
++                    'address': student_data.get('address', current.get('address')),
++                }
++                fill_district_fields(source, conn)
++                for key in DISTRICT_FIELDS:
++                    student_data[key] = source.get(key, '')
++                allowed_fields = allowed_fields + list(DISTRICT_FIELDS)
++        except Exception as exc:
++            logger.warning('区划联动失败，本次更新跳过区划列：%s', exc)
++
+         updates = []
+         values = []
+         for field, value in student_data.items():
+diff --git a/scripts/bench_district_match.py b/scripts/bench_district_match.py
+new file mode 100644
+index 0000000..1626ff7
+--- /dev/null
++++ b/scripts/bench_district_match.py
+@@ -0,0 +1,73 @@
++# -*- coding: utf-8 -*-
++"""区划匹配性能基准（可复现）。
++
++用法（仓库根目录）：
++    python scripts/bench_district_match.py --pack data/district_pack.tsv.gz
++
++说明：
++- 自动创建临时 USER_DATA_DIR，不触碰真实 student.db；
++- 全量导入数据包（664,239 行）后测 warm_cache / 单条 / 3000 行批量；
++- 输出供 CHANGES.md §6 引用的实测数字。
++"""
++import argparse
++import os
++import sys
++import tempfile
++import time
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, ROOT)
++os.environ.setdefault('USER_DATA_DIR', tempfile.mkdtemp(prefix='dm_bench_'))
++
++import models  # noqa: E402
++from models import district as dm  # noqa: E402
++
++SAMPLES = [
++    ('230104199001010011', '黑龙江省哈尔滨市道外区水泥路1号'),
++    ('110108199001010022', '北京市海淀区中关村大街1号'),
++    ('440305199001010033', '广东省深圳市南山区科技园南区'),
++    ('320509199001010044', '江苏省苏州市吴江区松陵镇'),
++    ('231183199001010055', '黑龙江省黑河市嫩江市嫩江镇'),
++    ('500120199001010066', '重庆市璧山区璧城街道'),
++    ('230105199001010077', '黑龙江省哈尔滨市太平区'),
++    ('', '黑龙江省哈尔滨市道外区水泥路街道水泥路社区'),
++]
++
++
++def main():
++    parser = argparse.ArgumentParser(description='区划匹配性能基准')
++    parser.add_argument('--pack', default=os.path.join(ROOT, 'data', 'district_pack.tsv.gz'))
++    parser.add_argument('--rows', type=int, default=3000)
++    args = parser.parse_args()
++
++    models.init_db()
++
++    started = time.perf_counter()
++    result = dm.import_dictionary(pack_file=args.pack)
++    print('import_seconds=%.2f total=%s by_level=%s'
++          % (time.perf_counter() - started, result.get('total'), result.get('by_level')))
++
++    started = time.perf_counter()
++    info = dm.warm_cache()
++    print('warm_seconds=%.2f rows=%s history_rows=%s'
++          % (time.perf_counter() - started, info.get('rows'), info.get('history_rows')))
++
++    rows = [{'id_card': SAMPLES[i % len(SAMPLES)][0],
++             'address': SAMPLES[i % len(SAMPLES)][1]} for i in range(args.rows)]
++    started = time.perf_counter()
++    dm.fill_district_fields_many(rows)
++    elapsed = time.perf_counter() - started
++    hits = sum(1 for r in rows if r.get('district_county_code'))
++    print('many_%d_seconds=%.3f per_row_ms=%.3f hits=%d'
++          % (args.rows, elapsed, elapsed * 1000 / args.rows, hits))
++
++    started = time.perf_counter()
++    for i in range(200):
++        dm.fill_district_fields({'id_card': SAMPLES[i % len(SAMPLES)][0],
++                                 'address': SAMPLES[i % len(SAMPLES)][1]}, dm.get_db())
++    print('single_row_ms=%.3f' % ((time.perf_counter() - started) * 1000 / 200))
++    print('district_db_bytes=%d' % os.path.getsize(dm.DISTRICT_DB_PATH))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/build_district_pack.py b/scripts/build_district_pack.py
+new file mode 100644
+index 0000000..7d589d3
+--- /dev/null
++++ b/scripts/build_district_pack.py
+@@ -0,0 +1,114 @@
++# -*- coding: utf-8 -*-
++"""生成 district_pack.tsv.gz（可复现：固定排序 + gzip mtime=0）。
++
++用法（在仓库根目录）：
++    python scripts/build_district_pack.py \
++        --source database/district_matcher.db \
++        --out data/district_pack.tsv.gz \
++        --max-level 5
++
++产出：
++    data/district_pack.tsv.gz   6 列 TSV（district_code/name/admin_level/parent_code/province_code/city_code）
++    data/district_pack.sha256   sha256 + 行数 + 各级行数 + 字节数
++
++不依赖 pandas / numpy，仅标准库。
++"""
++import argparse
++import gzip
++import hashlib
++import os
++import sqlite3
++import sys
++
++EXPECTED_TOTAL = 664239
++EXPECTED_LEVELS = {1: 31, 2: 343, 3: 3255, 4: 41274, 5: 619336}
++HEADER = "district_code\tdistrict_name\tadmin_level\tparent_code\tprovince_code\tcity_code\n"
++
++
++def build(source, out_path, max_level=5, verify=True):
++    conn = sqlite3.connect(source)
++    conn.row_factory = sqlite3.Row
++    try:
++        rows = conn.execute(
++            "SELECT id, district_code, district_name, admin_level, pid, "
++            "province_code, city_code FROM t_district_code "
++            "WHERE admin_level <= ? ORDER BY admin_level, district_code",
++            (max_level,)).fetchall()
++        id_to_code = {r["id"]: r["district_code"] for r in rows}
++
++        os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
++        # mtime=0 + 固定压缩级别 => 同样输入得到同样字节（便于 sha256 验收）
++        with open(out_path, "wb") as raw:
++            with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
++                               compresslevel=9, mtime=0) as gz:
++                gz.write(HEADER.encode("utf-8"))
++                counts = {}
++                total = 0
++                for r in rows:
++                    code = r["district_code"]
++                    parent = id_to_code.get(r["pid"], "") if r["pid"] else ""
++                    line = "%s\t%s\t%d\t%s\t%s\t%s\n" % (
++                        code, r["district_name"], r["admin_level"], parent,
++                        r["province_code"] or "", r["city_code"] or "")
++                    gz.write(line.encode("utf-8"))
++                    total += 1
++                    counts[r["admin_level"]] = counts.get(r["admin_level"], 0) + 1
++    finally:
++        conn.close()
++
++    size = os.path.getsize(out_path)
++    h = hashlib.sha256()
++    with open(out_path, "rb") as f:
++        for block in iter(lambda: f.read(1024 * 1024), b""):
++            h.update(block)
++    digest = h.hexdigest()
++
++    summary = {
++        "total": total,
++        "by_level": dict(sorted(counts.items())),
++        "size": size,
++        "sha256": digest,
++        "max_level": max_level,
++    }
++
++    sha_path = os.path.splitext(out_path)[0] + ".sha256"
++    with open(sha_path, "w", encoding="utf-8") as f:
++        f.write("# district_pack.tsv.gz 校验信息（由 scripts/build_district_pack.py 生成）\n")
++        f.write("sha256  %s\n" % digest)
++        f.write("size    %d\n" % size)
++        f.write("total   %d\n" % total)
++        f.write("levels  " + " ".join("%d:%d" % kv for kv in sorted(counts.items())) + "\n")
++
++    print("数据包：%s" % out_path)
++    print("sha256：%s" % digest)
++    print("大小  ：%d 字节（%.2f MB）" % (size, size / 1024.0 / 1024.0))
++    print("行数  ：%d" % total)
++    print("各级  ：%s" % summary["by_level"])
++
++    if verify and max_level == 5:
++        if total != EXPECTED_TOTAL or dict(counts) != EXPECTED_LEVELS:
++            print("警告：行数与文档 2.4 不一致（期望 total=%d, levels=%s）"
++                  % (EXPECTED_TOTAL, EXPECTED_LEVELS))
++    return summary
++
++
++def main():
++    parser = argparse.ArgumentParser(description="生成区划字典数据包")
++    parser.add_argument("--source", default=os.path.join("database", "district_matcher.db"),
++                        help="源字典库（含 t_district_code）")
++    parser.add_argument("--out", default=os.path.join("data", "district_pack.tsv.gz"),
++                        help="输出数据包路径")
++    parser.add_argument("--max-level", type=int, default=5,
++                        help="最大层级：5=全量（默认）；4=仅省/市/区县（应急降级）")
++    parser.add_argument("--no-verify", action="store_true", help="跳过行数校验")
++    args = parser.parse_args()
++
++    if not os.path.exists(args.source):
++        print("源库不存在：%s" % args.source, file=sys.stderr)
++        return 1
++    build(args.source, args.out, max_level=args.max_level, verify=not args.no_verify)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/services/district_match/__init__.py b/services/district_match/__init__.py
+new file mode 100644
+index 0000000..736e150
+--- /dev/null
++++ b/services/district_match/__init__.py
+@@ -0,0 +1,7 @@
++"""区划匹配服务包（纯算法层 + 导入导出）。
++
++约束（见 PORTING_GUIDE 3.2）：
++- 本包内不得 import flask / models / config，只允许标准库与包内相对导入；
++- 字典读取一律通过外部注入的 Repository（鸭子类型），便于 FakeRepo 单测；
++- 包内 `models` 是 dataclass 模块，不是目标系统的 models 包，一律 `from .models import ...`。
++"""
+diff --git a/services/district_match/address_parser.py b/services/district_match/address_parser.py
+new file mode 100644
+index 0000000..4fee3df
+--- /dev/null
++++ b/services/district_match/address_parser.py
+@@ -0,0 +1,134 @@
++"""地址文本解析工具：从完整地址中提取省/市/区县名称（原样迁移）。
++
++仅改动：`import config` → `from . import constants as config`。
++"""
++import re
++
++from . import constants as config
++
++MUNICIPAL_NAMES = list(config.MUNICIPALITIES.values())  # 北京市 等
++
++# 自治区（及常见简称）→ 全称映射：地址中常省略“回族自治区”等后缀
++_PROVINCE_SHORT_MAP = {
++    "内蒙古": "内蒙古自治区",
++    "广西": "广西壮族自治区",
++    "西藏": "西藏自治区",
++    "宁夏": "宁夏回族自治区",
++    "新疆": "新疆维吾尔自治区",
++}
++
++
++def _expand_province_short(text):
++    """将地址开头的自治区简称扩展为全称，使后续正则能正确识别并剥离省前缀。
++
++    例如："宁夏彭阳县..." → "宁夏回族自治区彭阳县..."
++    """
++    for short, full in _PROVINCE_SHORT_MAP.items():
++        if text.startswith(full):
++            return text
++        if text.startswith(short):
++            # 避免把“广西省”这类旧称展开成“广西壮族自治区省”
++            if text.startswith(short + "省"):
++                return text
++            return full + text[len(short):]
++    return text
++
++
++PROVINCE_RE = re.compile(r"([\u4e00-\u9fa5]{1,10}?(?:省|自治区))")
++MUNICIPAL_RE = re.compile(r"(北京市|天津市|上海市|重庆市)")
++CITY_RE = re.compile(r"([\u4e00-\u9fa5]{1,10}?(?:市|自治州|地区|盟))")
++# 避免把“社区”中的“区”误当作行政区划后缀
++DISTRICT_RE = re.compile(r"([\u4e00-\u9fa5]{1,12}?(?:自治县|(?<!社)区|县|旗|新区))")
++# 层级4（乡镇/街道）候选：用于辅助反推上层区县
++TOWN_RE = re.compile(
++    r"([\u4e00-\u9fa5]{1,12}?(?:街道办事处|街道|民族乡|乡|镇|民族苏木|苏木))"
++)
++# 层级5（村/社区）候选：作为最后兜底反推
++VILLAGE_RE = re.compile(
++    r"([\u4e00-\u9fa5]{1,12}?(?:社区居民委员会|村民委员会|社区|居委会|村|嘎查))"
++)
++
++
++def parse_address(address):
++    """从地址文本提取三级行政区划名称。
++
++    返回 {"province": str|None, "city": str|None, "district": str|None,
++          "township": str|None, "village": str|None}
++    仅做名称提取，不保证与数据库匹配（由引擎②反查负责）。
++    """
++    if not address or not address.strip():
++        return {"province": None, "city": None, "district": None,
++                "township": None, "village": None}
++
++    text = address.strip()
++    text = _expand_province_short(text)
++    result = {"province": None, "city": None, "district": None,
++              "township": None, "village": None}
++
++    # 1) 省级
++    mun = MUNICIPAL_RE.search(text)
++    if mun:
++        result["province"] = mun.group(1)
++    else:
++        prov = PROVINCE_RE.search(text)
++        if prov:
++            result["province"] = prov.group(1)
++
++    # 2) 市级
++    if result["province"] in MUNICIPAL_NAMES:
++        # 直辖市：市级即省级本身
++        result["city"] = result["province"]
++    else:
++        # 先剔除省名前缀再匹配市，避免"黑龙江省嫩江市"整体被当作市名
++        search_text = text
++        if result["province"] and result["province"] in text:
++            idx = text.find(result["province"])
++            search_text = text[idx + len(result["province"]):]
++        for m in CITY_RE.finditer(search_text):
++            name = m.group(1)
++            if name == result["province"]:
++                continue
++            # 跳过“市辖区”虚拟名
++            if name == "市辖区":
++                continue
++            result["city"] = name
++            break
++
++    # 3) 计算剩余文本：剔除已识别的省/市前缀，供抽取区县/乡镇/村
++    if result["province"] in MUNICIPAL_NAMES:
++        prefix = result["province"]
++        rest = text[text.find(prefix) + len(prefix):] if prefix in text else text
++    elif result["city"]:
++        rest = text[text.find(result["city"]) + len(result["city"]):] if result["city"] in text else text
++    elif result["province"]:
++        # 地址可能省后直接跟区县（如“黑龙江省依兰县…”）。
++        # 若不剔除省名前缀，区县正则会误取“黑龙江省依兰县”。
++        prefix = result["province"]
++        rest = text[text.find(prefix) + len(prefix):] if prefix in text else text
++    else:
++        rest = text
++
++    # 3.1) 区县级
++    district_m = None
++    for m in DISTRICT_RE.finditer(rest):
++        name = m.group(1)
++        if result["city"] and name == result["city"]:
++            continue
++        result["district"] = name
++        district_m = m
++        break
++
++    # 3.2) 乡镇/村（层级4/5）候选：在剔除省/市/区县后的剩余文本中抽取，
++    #      避免长区县名（如“莫力达瓦达斡尔族自治旗”）被乡镇/村正则钻取
++    rest_for_town_village = rest[district_m.end():] if district_m else rest
++
++    tm = TOWN_RE.search(rest_for_town_village)
++    rest_for_village = rest_for_town_village[tm.end():] if tm else rest_for_town_village
++    if tm:
++        result["township"] = tm.group(1)
++
++    vm = VILLAGE_RE.search(rest_for_village)
++    if vm:
++        result["village"] = vm.group(1)
++
++    return result
+diff --git a/services/district_match/constants.py b/services/district_match/constants.py
+new file mode 100644
+index 0000000..d37dfac
+--- /dev/null
++++ b/services/district_match/constants.py
+@@ -0,0 +1,56 @@
++"""常量：替代原项目 config.py 中被算法层引用的部分。
++
++原则：只搬算法需要的常量，不搬路径/端口/上传目录等运行时配置。
++"""
++
++# 直辖市：前 2 位 -> 名称
++MUNICIPALITIES = {
++    "11": "北京市",
++    "12": "天津市",
++    "31": "上海市",
++    "50": "重庆市",
++}
++
++# 12 位代码补零规则
++PROVINCE_PAD = "0000000000"   # 2 位 + 10 个 0
++CITY_PAD = "00000000"         # 4 位 + 8 个 0
++DISTRICT_PAD = "000000"       # 6 位 + 6 个 0
++
++# 匹配状态枚举（v2，共 7 种）
++STATUS_CORRECT = "正确"
++STATUS_PARSED = "已解析"
++STATUS_PARSED_ID_ONLY = "已解析(仅证件)"
++STATUS_REVIEW = "需复核"
++STATUS_PARTIAL = "部分"
++STATUS_NOMATCH = "无匹配"
++STATUS_ERROR = "异常"
++
++ALL_STATUSES = (
++    STATUS_CORRECT,
++    STATUS_PARSED,
++    STATUS_PARSED_ID_ONLY,
++    STATUS_REVIEW,
++    STATUS_PARTIAL,
++    STATUS_NOMATCH,
++    STATUS_ERROR,
++)
++
++ADMIN_LEVEL_NAME = {1: "省", 2: "市", 3: "区县", 4: "街道/镇", 5: "村/社区"}
++
++# 录入联动：students 表 7 个区划列（字段名锁定，不得改名）
++DISTRICT_FIELDS = (
++    "district_province_name",
++    "district_province_code",
++    "district_city_name",
++    "district_city_code",
++    "district_county_name",
++    "district_county_code",
++    "district_match_status",
++)
++
++# 字典库文件名（与 student.db 同目录，由 0.2 #3 的路径规则推导）
++DISTRICT_DB_FILENAME = "district.db"
++DISTRICT_PACK_FILENAME = "district_pack.tsv.gz"
++
++# 缓存常驻层级上限：L1–L4 常驻内存，L5 走 SQL
++CACHE_MAX_LEVEL = 4
+diff --git a/services/district_match/decider.py b/services/district_match/decider.py
+new file mode 100644
+index 0000000..229b7ca
+--- /dev/null
++++ b/services/district_match/decider.py
+@@ -0,0 +1,115 @@
++"""双引擎决策器 v2：引擎②（地址）为主，引擎①（身份证）校验/兜底。
++
++设计原则：
++- 行政层级3（区县/县级市）是主判定锚点。引擎②解析出层级3即采用其全量结果；
++- 引擎①仅做一致性校验（一致→正确，冲突→需复核）与兜底补充；
++- 归属永远先问引擎②，从架构上杜绝跨引擎省市区县拼接。
++
++仅改动：`from database.models import MatchResult` → `from .models import MatchResult`。
++"""
++from .models import MatchResult
++
++
++def dual_engine_decide(db, engine1_result, engine2_result):
++    """决策逻辑（v2，引擎②为主）。
++
++    A  e2 层级3命中           -> 采用引擎②全量；引擎①校验（一致=正确，冲突=需复核）
++    B  e2 仅省/市 + e1区县    -> 地址省市 + 证件区县（已解析）
++    C  e2 抽出区县名无代码     -> 需复核
++    D  e2 无输出              -> 纯引擎①兜底（已解析(仅证件)/部分/无匹配/异常）
++    """
++    res = MatchResult()
++    e1 = engine1_result
++    e2 = engine2_result
++    e1_err = getattr(e1, "error", None)
++    e2_l3 = bool(e2 and e2.district_code)
++
++    # 兜底名称（展示用）
++    res.province_name = (e2.province if e2 else None) or e1.province.name
++    res.city_name = (e2.city if e2 else None) or e1.city.name
++    res.district_name = (e2.district if e2 else None) or e1.district.name
++
++    def _fill_from_e1():
++        res.province_name = e1.province.name
++        res.city_name = e1.city.name
++        res.district_name = e1.district.name
++        res.province_code = e1.province.code
++        res.city_code = e1.city.code
++        res.district_code = e1.district.code
++
++    if e2_l3:
++        # 主引擎②：采用其全量（省/市/区县）
++        res.province_name = e2.province
++        res.city_name = e2.city
++        res.district_name = e2.district
++        res.province_code = e2.province_code
++        res.city_code = e2.city_code
++        res.district_code = e2.district_code
++        if e1_err:
++            res.match_status = "已解析"
++            res.decision_path = "引擎②解析层级3成功（身份证异常，以地址为准）"
++        else:
++            # 以名称一致性校验（比代码前缀更鲁棒，天然兼容直辖市市代码表示差异）
++            prov_ok = (e1.province.matched and e2.province
++                       and e1.province.name == e2.province)
++            city_ok = (e1.city.matched and e2.city
++                       and e1.city.name == e2.city)
++            prov_conflict = (e1.province.matched and e2.province
++                             and e1.province.name != e2.province)
++            city_conflict = (e1.city.matched and e2.city
++                             and e1.city.name != e2.city)
++            if prov_conflict or city_conflict:
++                res.match_status = "需复核"
++                res.decision_path = (
++                    f"引擎②解析层级3，但引擎①证件归属"
++                    f"(省={e1.province.name or '-'}/市={e1.city.name or '-'})"
++                    f"与地址(省={e2.province or '-'}/市={e2.city or '-'})不一致，"
++                    f"以地址为准，标记需复核"
++                )
++            elif prov_ok and city_ok:
++                res.match_status = "正确"
++                res.decision_path = "引擎②解析层级3，引擎①省/市一致（双校验通过）"
++            else:
++                res.match_status = "已解析"
++                res.decision_path = "引擎②解析层级3成功（引擎①未完整校验，以地址为准）"
++
++    elif e2 and (e2.province or e2.city) and not e2.district_code:
++        # 引擎②仅命中省/市，未解析层级3 -> 引擎①补充层级3
++        res.province_name = e2.province or e1.province.name
++        res.city_name = e2.city or e1.city.name
++        res.province_code = e2.province_code or (e1.province.code if e1.province.matched else None)
++        res.city_code = e2.city_code or (e1.city.code if e1.city.matched else None)
++        if e1.district.matched:
++            res.district_name = e1.district.name
++            res.district_code = e1.district.code
++            res.match_status = "已解析"
++            res.decision_path = "引擎②解析省/市，引擎①补充层级3（地址省市+证件区县）"
++        else:
++            res.match_status = "需复核"
++            res.decision_path = "引擎②仅解析省/市，引擎①亦无层级3，标记需复核"
++
++    elif e2 and e2.district and not e2.district_code:
++        # 引擎②抽出区县名但未反查到代码（极端情况）
++        res.match_status = "需复核"
++        res.decision_path = "引擎②抽出区县名但未反查到代码，标记需复核"
++
++    else:
++        # 引擎②无有效输出（地址空/无法解析）-> 纯引擎①兜底
++        if e1_err:
++            res.match_status = "异常"
++            res.engine1_detail = f"引擎①异常：{e1_err}"
++            _fill_from_e1()
++        elif e1.district.matched:
++            res.match_status = "已解析(仅证件)"
++            _fill_from_e1()
++            res.decision_path = "地址为空/无法解析，纯引擎①（身份证）兜底"
++        elif e1.province.matched or e1.city.matched:
++            res.match_status = "部分"
++            _fill_from_e1()
++            res.decision_path = "引擎①仅解析省/市，无层级3（部分）"
++        else:
++            res.match_status = "无匹配"
++            _fill_from_e1()
++            res.decision_path = "引擎①与引擎②均未能确定层级3（无匹配）"
++
++    return res
+diff --git a/services/district_match/engine1.py b/services/district_match/engine1.py
+new file mode 100644
+index 0000000..556b089
+--- /dev/null
++++ b/services/district_match/engine1.py
+@@ -0,0 +1,62 @@
++"""引擎①：身份证前 6 位层级匹配行政区划（原样迁移）。
++
++仅改动：import 指向包内 constants / models / validators，逻辑零改动。
++"""
++from . import constants as config
++from .models import Engine1Result, LevelResult
++from . import validators
++
++
++def build_codes(first6):
++    """由身份证前 6 位构造三级 12 位匹配代码。"""
++    province_code = first6[:2] + config.PROVINCE_PAD       # AB + 10*0
++    city_code = first6[:4] + config.CITY_PAD               # ABCD + 8*0
++    district_code = first6 + config.DISTRICT_PAD           # ABCDEF + 6*0
++    return province_code, city_code, district_code
++
++
++def engine1_match(db, id_card):
++    """输入身份证号，输出 Engine1Result（省/市/区县三级匹配结果）。
++
++    db 为鸭子类型 Repository，需提供：
++      get_by_district_code(code, level=None)、get_history_code_map()
++    """
++    first6 = validators.get_id_first6(id_card)
++    if first6 is None:
++        return Engine1Result(error="身份证前6位非数字或长度不足")
++
++    province_code, city_code, district_code = build_codes(first6)
++    res = Engine1Result()
++
++    prov = db.get_by_district_code(province_code, 1)
++    if prov:
++        res.province = LevelResult(code=prov["district_code"],
++                                   name=prov["district_name"], matched=True)
++
++    if first6[:2] in config.MUNICIPALITIES and res.province.matched:
++        # 直辖市：市级即省级本身（真实数据中直辖市存在 level-2 的“市辖区”虚拟节点，跳过）
++        res.city = LevelResult(code=res.province.code,
++                               name=res.province.name, matched=True)
++    else:
++        city = db.get_by_district_code(city_code, 2)
++        if city:
++            res.city = LevelResult(code=city["district_code"],
++                                   name=city["district_name"], matched=True)
++
++    dist = db.get_by_district_code(district_code, 3)
++    if dist and dist["district_name"] != "市辖区":
++        res.district = LevelResult(code=dist["district_code"],
++                                   name=dist["district_name"], matched=True)
++    else:
++        # 历史代码映射直查：身份证签发地代码已撤销（如 230105 太平区）时，
++        # 经 dm_history_mapping 旧码->新码 翻译后按现行代码命中。
++        code_map = db.get_history_code_map() or {}
++        new6 = code_map.get(first6)
++        if new6:
++            mapped = db.get_by_district_code(new6 + config.DISTRICT_PAD, 3)
++            if mapped and mapped["district_name"] != "市辖区":
++                res.district = LevelResult(code=mapped["district_code"],
++                                           name=mapped["district_name"],
++                                           matched=True, mapped=True)
++
++    return res
+diff --git a/services/district_match/engine2.py b/services/district_match/engine2.py
+new file mode 100644
+index 0000000..26fb6b8
+--- /dev/null
++++ b/services/district_match/engine2.py
+@@ -0,0 +1,239 @@
++"""引擎②：地址文本解析 + 层级3（区县/县级市）反查（原样迁移）。
++
++设计原则（v2）：
++- 地址是主信息源，行政层级3（区县/县级市）是主判定锚点；
++- 当层级3为县级市（XX市）且地址省略了层级2的市时，必须确保反查成功，
++  并据此推导父级市/省；
++- 区划字典含层级4（乡镇/街道）与层级5（村/社区）数据，
++  在层级3无法由名称直接命中时，可用乡镇/村反推上层区县。
++
++仅改动：import 指向包内模块，逻辑零改动。
++"""
++import re
++
++from .models import Engine2Result
++from . import address_parser
++
++# 用于从地址中扫描层级3（区县/县级市）候选：XX市/县/区/旗/自治县/新区
++# 使用 lazy 量词，避免把"黑龙江省黑河市嫩江市"整体当作一个候选
++_COUNTY_CANDIDATE_RE = re.compile(
++    r"([\u4e00-\u9fa5]{1,10}?(?:自治县|市|县|区|旗|新区))"
++)
++
++
++def _lookup_county(db, name, city_pid=None):
++    """按名称查层级3，支持历史别名映射；返回 (row, 实际命中的标准名)。
++
++    顺序设计（v2.3，修复同名跨区误配）：
++    1) 有别名时优先尝试别名——地址旧名多为已撤销区划（如哈尔滨"太平区"），
++       若先查旧名本身，全局反查会误命中同名现行区划（如阜新市太平区）。
++    2) 全部候选先限在当前市级范围(pid)内反查，范围内未命中才做全局兜底。
++    """
++    if not name:
++        return None, name
++    alias = (db.get_history_alias_map() or {}).get(name)
++    if alias and alias != name:
++        candidates = [alias, name]
++    else:
++        candidates = [name]
++    # 1) 优先在当前市级范围内反查（避免同名跨区误配）
++    if city_pid:
++        for try_name in candidates:
++            row = db.reverse_lookup(try_name, 3, pid=city_pid)
++            if row:
++                return row, try_name
++    # 2) 全局兜底（无市级范围，或范围内均未命中）
++    for try_name in candidates:
++        row = db.reverse_lookup(try_name, 3)
++        if row:
++            return row, try_name
++    return None, name
++
++
++def _find_county_candidate(db, address, exclude, city_pid=None):
++    """从地址中扫描可能的层级3名称并反查。
++
++    exclude: 需要排除的名称集合（已识别的省/市）
++    city_pid: 若已知所属市，优先在该市范围内反查
++    返回 (命中行, 命中名) 或 (None, None)，与 _lookup_county 返回契约一致
++    """
++    seen = set()
++    for m in _COUNTY_CANDIDATE_RE.finditer(address):
++        name = m.group(1)
++        if name in exclude or name in seen:
++            continue
++        seen.add(name)
++        if name in ("市辖区",):
++            continue
++        # 优先在已知市范围内反查
++        row = None
++        if city_pid:
++            row = db.reverse_lookup(name, 3, pid=city_pid)
++        if not row:
++            row = db.reverse_lookup(name, 3)
++        if row:
++            return row, name
++    return None, None
++
++
++def _apply_county(db, res, county_row, city_pid_holder):
++    """用命中的层级3行填充 district，并向上推导 city/province。
++
++    city_pid_holder: 单元素列表 [city_pid]，便于跨步骤共享。
++    """
++    res.district = county_row["district_name"]
++    res.district_code = county_row["district_code"]
++    parent = db.get_by_id(county_row["pid"]) if county_row.get("pid") else None
++    if parent and parent["admin_level"] == 2:
++        if parent["district_name"] == "市辖区":
++            # 直辖市虚拟节点（真实库中区县 pid 指向"市辖区"）：市级即省级本身，
++            # 与 parse_address / 引擎①直辖市约定一致，避免 city 被覆盖为"市辖区"。
++            pp = db.get_by_id(parent["pid"]) if parent.get("pid") else None
++            if pp and pp["admin_level"] == 1:
++                res.province = pp["district_name"]
++                res.province_code = pp["district_code"]
++                res.city = pp["district_name"]
++                res.city_code = pp["district_code"]
++            elif res.province:
++                res.city = res.province
++                res.city_code = res.province_code
++            if city_pid_holder is not None:
++                city_pid_holder[0] = parent["id"]
++        else:
++            # 县级市/县的上层是地级市
++            res.city = parent["district_name"]
++            res.city_code = parent["district_code"]
++            city_pid_holder[0] = parent["id"]
++            if not res.province:
++                pp = db.get_by_id(parent["pid"])
++                if pp and pp["admin_level"] == 1:
++                    res.province = pp["district_name"]
++                    res.province_code = pp["district_code"]
++    elif parent and parent["admin_level"] == 1:
++        # 省直管县/直辖市：city 置为省/市名（与 parser/引擎①直辖市约定一致）
++        res.city = parent["district_name"]
++        res.city_code = parent["district_code"]
++        res.province = parent["district_name"]
++        res.province_code = parent["district_code"]
++        if city_pid_holder is not None:
++            city_pid_holder[0] = parent["id"]
++
++
++def _lookup_by_ancestor(db, name, level, scope_level, scope_id):
++    """在指定范围（scope_level=1 按省，2 按市）内按名称反查层级 level。
++
++    乡镇/村的 pid 是其直接父级（区县/乡镇），并非省/市，
++    故需沿父链向上核对归属，避免同名跨区误匹配。
++    """
++    if not name:
++        return None
++    cands = db.search_by_name(name, level) or []
++    if not cands:
++        return None
++    if scope_level is None or scope_id is None:
++        return cands[0]
++    for row in cands:
++        cur = row
++        depth = 0
++        while cur and depth < 6:
++            if cur["admin_level"] == scope_level:
++                if cur["id"] == scope_id:
++                    return row
++                break
++            cur = db.get_by_id(cur["pid"]) if cur.get("pid") else None
++            depth += 1
++    return None
++
++
++def _try_town_village_fallback(db, res, city_pid_holder):
++    """层级3名称未命中时的兜底：用乡镇(层级4)/村(层级5)反推上层区县。
++
++    优先在已识别的市(层级2)范围内反查，否则按省(层级1)；乡镇优先于村。
++    """
++    if res.district_code:
++        return
++    # 确定范围：优先已识别的市，否则省
++    scope_level, scope_id = None, None
++    if city_pid_holder and city_pid_holder[0]:
++        scope_level, scope_id = 2, city_pid_holder[0]
++    elif res.province:
++        pr = db.reverse_lookup(res.province, 1)
++        if pr:
++            scope_level, scope_id = 1, pr["id"]
++    # 层级4 乡镇/街道 -> 父级即层级3
++    if res.township:
++        t = _lookup_by_ancestor(db, res.township, 4, scope_level, scope_id)
++        if t and t.get("pid"):
++            county = db.get_by_id(t["pid"])
++            if county and county["admin_level"] == 3:
++                _apply_county(db, res, county, city_pid_holder)
++                return
++    # 层级5 村/社区 -> 父级层级4 -> 再父级层级3
++    if not res.district_code and res.village:
++        v = _lookup_by_ancestor(db, res.village, 5, scope_level, scope_id)
++        if v and v.get("pid"):
++            tw = db.get_by_id(v["pid"])
++            if tw and tw.get("pid"):
++                county = db.get_by_id(tw["pid"])
++                if county and county["admin_level"] == 3:
++                    _apply_county(db, res, county, city_pid_holder)
++
++
++def engine2_parse(db, address, id_card=None):
++    """输入地址文本，输出 Engine2Result（解析出的名称 + 反查得到的 12 位代码）。"""
++    parsed = address_parser.parse_address(address)
++    res = Engine2Result(
++        province=parsed["province"],
++        city=parsed["city"],
++        district=parsed["district"],
++        township=parsed.get("township"),
++        village=parsed.get("village"),
++    )
++    city_pid = [None]  # 可变容器，跨步骤共享
++
++    # 步骤1：解析市级（层级2）。若“市”实为县级市（省略了地级市），
++    # 则作为层级3处理并推导父级市/省。
++    if res.city:
++        city_row = db.reverse_lookup(res.city, 2)
++        if city_row:
++            res.city_code = city_row["district_code"]
++            city_pid[0] = city_row["id"]
++            if not res.province and city_row.get("pid"):
++                prov_row = db.get_by_id(city_row["pid"])
++                if prov_row:
++                    res.province = prov_row["district_name"]
++                    res.province_code = prov_row["district_code"]
++        else:
++            # 县级市（XX市）省略层级2：直接作为层级3，并推导父级
++            county_row, county_name = _lookup_county(db, res.city)
++            if county_row:
++                _apply_county(db, res, county_row, city_pid)
++
++    # 步骤2：由区县名反查层级3（优先在已知市范围内）
++    if res.district and not res.district_code:
++        county_row, county_name = _lookup_county(db, res.district, city_pid[0])
++        if county_row:
++            res.district = county_name
++            res.district_code = county_row["district_code"]
++            _apply_county(db, res, county_row, city_pid)
++
++    # 步骤3：兜底扫描地址中的 XX市/县/区/旗 候选
++    if not res.district_code:
++        exclude = {x for x in (res.province, res.city) if x}
++        county_row, county_name = _find_county_candidate(
++            db, address, exclude, city_pid[0])
++        if county_row:
++            res.district = county_name
++            res.district_code = county_row["district_code"]
++            _apply_county(db, res, county_row, city_pid)
++
++    # 步骤4：乡镇/村辅助反推层级3（字典含层级4/5数据）
++    _try_town_village_fallback(db, res, city_pid)
++
++    # 步骤5：补全省级代码
++    if res.province and not res.province_code:
++        row = db.reverse_lookup(res.province, 1)
++        if row:
++            res.province_code = row["district_code"]
++
++    return res
+diff --git a/services/district_match/exporter.py b/services/district_match/exporter.py
+new file mode 100644
+index 0000000..bdb351f
+--- /dev/null
++++ b/services/district_match/exporter.py
+@@ -0,0 +1,56 @@
++"""匹配结果导出（xlsx / csv），含公式注入防护。"""
++import csv
++
++EXPORT_COLUMNS = [
++    ("student_name", "学生姓名"),
++    ("id_card", "身份证号"),
++    ("address", "地址"),
++    ("province_name", "省"),
++    ("city_name", "市"),
++    ("district_name", "区县"),
++    ("match_status", "状态"),
++    ("engine1_result", "引擎①过程"),
++    ("engine2_result", "引擎②过程"),
++    ("remark", "说明"),
++]
++
++_FORMULA_PREFIX = ("=", "+", "-", "@", "\t", "\r")
++
++
++def _safe_cell(value):
++    """公式注入防护：以 = + - @ 等开头的文本前置单引号。"""
++    if value is None:
++        return ""
++    text = str(value)
++    if text.startswith(_FORMULA_PREFIX):
++        return "'" + text
++    return text
++
++
++def export_results(rows, out_path, fmt="xlsx"):
++    """把匹配结果写成 xlsx / csv，返回 out_path。
++
++    rows: dict 列表，键见 EXPORT_COLUMNS（缺键按空字符串输出）。
++    """
++    ext = (fmt or "").lower().lstrip(".")
++    if ext in ("xlsx", "xlsm"):
++        import openpyxl
++        wb = openpyxl.Workbook()
++        ws = wb.active
++        ws.title = "区划匹配结果"
++        ws.append([title for _key, title in EXPORT_COLUMNS])
++        for row in rows:
++            ws.append([_safe_cell(row.get(key)) for key, _title in EXPORT_COLUMNS])
++        wb.save(out_path)
++        return out_path
++
++    if ext in ("csv", "tsv"):
++        delimiter = "\t" if ext == "tsv" else ","
++        with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
++            writer = csv.writer(f, delimiter=delimiter)
++            writer.writerow([title for _key, title in EXPORT_COLUMNS])
++            for row in rows:
++                writer.writerow([_safe_cell(row.get(key)) for key, _title in EXPORT_COLUMNS])
++        return out_path
++
++    raise ValueError("仅支持导出 xlsx / csv")
+diff --git a/services/district_match/importer.py b/services/district_match/importer.py
+new file mode 100644
+index 0000000..dc5681b
+--- /dev/null
++++ b/services/district_match/importer.py
+@@ -0,0 +1,193 @@
++"""数据包导入与批量输入解析。
++
++导入只接收调用方提供的连接（一次性连接由蓝图/脚本创建，见 0.2 #1b）：
++- 不 import Flask / models，便于离线脚本复用；
++- DDL 由调用方以 schema_sql 传入（DDL 统一维护在 models/db.py，遵守项目铁律 3）；
++- 清空 + 重灌，中途失败回滚并清空半成品，避免“半套字典”；
++- 导入期间不建临时表、不执行 VACUUM（105 MB 库约数秒）。
++"""
++import os
++
++from . import pack as pack_mod
++
++_INSERT_SQL = (
++    "INSERT INTO dm_district_code "
++    "(district_code, district_name, admin_level, parent_code, province_code, city_code) "
++    "VALUES (?,?,?,?,?,?)"
++)
++
++
++def import_pack(conn, pack_path, schema_sql=(), batch_size=5000,
++                on_progress=None, max_level=5):
++    """把 district_pack.tsv.gz 导入 dm_district_code。
++
++    返回 {"total": int, "by_level": {...}}；失败抛异常且库内不留半成品。
++    前置：conn 为裸 sqlite3.Connection（建议 isolation_level=None，显式事务）。
++    """
++    if not os.path.exists(pack_path):
++        raise FileNotFoundError(f"数据包不存在：{pack_path}")
++
++    statements = (schema_sql.split(';') if isinstance(schema_sql, str)
++                  else schema_sql)
++    for stmt in statements:
++        if stmt.strip():
++            conn.execute(stmt)
++
++    total = 0
++    by_level = {}
++    try:
++        conn.execute("BEGIN IMMEDIATE")
++        conn.execute("DELETE FROM dm_district_code")
++        buf = []
++        for row in pack_mod.iter_pack_rows(pack_path):
++            if row[2] > max_level:
++                continue
++            buf.append(row)
++            total += 1
++            by_level[row[2]] = by_level.get(row[2], 0) + 1
++            if len(buf) >= batch_size:
++                conn.executemany(_INSERT_SQL, buf)
++                buf.clear()
++                if on_progress:
++                    on_progress(total)
++        if buf:
++            conn.executemany(_INSERT_SQL, buf)
++        conn.execute("COMMIT")
++    except Exception:
++        try:
++            conn.execute("ROLLBACK")
++        except Exception:
++            pass
++        # 二次兜底：清掉可能残留的半成品（ROLLBACK 失效时）
++        try:
++            conn.execute("DELETE FROM dm_district_code")
++            conn.commit()
++        except Exception:
++            pass
++        raise
++
++    if on_progress:
++        on_progress(total)
++    return {"total": total, "by_level": by_level}
++
++
++# ---------------------------------------------------------------- 批量输入解析
++def _norm_header(value):
++    return str(value or "").strip().replace("　", "")
++
++
++def _row_to_dict(header, raw):
++    item = {}
++    for i, key in enumerate(header):
++        if not key:
++            continue
++        item[key] = "" if i >= len(raw) or raw[i] is None else str(raw[i]).strip()
++    return item
++
++
++def read_input_rows(path, limit=None):
++    """读取上传的 xlsx/csv，返回 (headers, rows)。
++
++    rows 为 dict 列表（列名 -> 文本值），用于“预览 + 列映射”弹窗。
++    只用 openpyxl（项目已有依赖），不引入 pandas。
++    """
++    ext = os.path.splitext(path)[1].lower()
++    if ext in (".xlsx", ".xlsm"):
++        import openpyxl
++        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
++        try:
++            ws = wb.active
++            it = ws.iter_rows(values_only=True)
++            try:
++                header = [_norm_header(x) for x in next(it)]
++            except StopIteration:
++                return [], []
++            rows = []
++            for raw in it:
++                if limit is not None and len(rows) >= limit:
++                    break
++                if raw is None or all(x is None or str(x).strip() == "" for x in raw):
++                    continue
++                rows.append(_row_to_dict(header, raw))
++            return header, rows
++        finally:
++            wb.close()
++
++    if ext == ".csv":
++        import csv
++        for enc in ("utf-8-sig", "gbk"):
++            try:
++                with open(path, "r", encoding=enc, newline="") as f:
++                    reader = csv.reader(f)
++                    try:
++                        header = [_norm_header(x) for x in next(reader)]
++                    except StopIteration:
++                        return [], []
++                    rows = []
++                    for raw in reader:
++                        if limit is not None and len(rows) >= limit:
++                            break
++                        if not raw or all(str(x).strip() == "" for x in raw):
++                            continue
++                        rows.append(_row_to_dict(header, raw))
++                    return header, rows
++            except UnicodeDecodeError:
++                continue
++        raise ValueError("CSV 编码无法识别（支持 UTF-8 / GBK）")
++
++    raise ValueError("仅支持 .xlsx / .xlsm / .csv 文件")
++
++
++def iter_input_rows(path, id_card_col, address_col):
++    """流式读取全量输入行，产出 (row_no, id_card, address)。"""
++    ext = os.path.splitext(path)[1].lower()
++
++    def _pick(header, raw, col):
++        if col not in header:
++            return ""
++        idx = header.index(col)
++        if idx >= len(raw) or raw[idx] is None:
++            return ""
++        return str(raw[idx]).strip()
++
++    if ext in (".xlsx", ".xlsm"):
++        import openpyxl
++        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
++        try:
++            ws = wb.active
++            it = ws.iter_rows(values_only=True)
++            try:
++                header = [_norm_header(x) for x in next(it)]
++            except StopIteration:
++                return
++            for n, raw in enumerate(it, start=2):
++                if raw is None:
++                    continue
++                id_card = _pick(header, raw, id_card_col)
++                address = _pick(header, raw, address_col)
++                if not id_card and not address:
++                    continue
++                yield n, id_card, address
++        finally:
++            wb.close()
++        return
++
++    import csv
++    for enc in ("utf-8-sig", "gbk"):
++        try:
++            with open(path, "r", encoding=enc, newline="") as f:
++                reader = csv.reader(f)
++                try:
++                    header = [_norm_header(x) for x in next(reader)]
++                except StopIteration:
++                    return
++                for n, raw in enumerate(reader, start=2):
++                    id_card = _pick(header, raw, id_card_col)
++                    address = _pick(header, raw, address_col)
++                    if not id_card and not address:
++                        continue
++                    yield n, id_card, address
++                return
++        except UnicodeDecodeError:
++            continue
++    raise ValueError("CSV 编码无法识别（支持 UTF-8 / GBK）")
+diff --git a/services/district_match/models.py b/services/district_match/models.py
+new file mode 100644
+index 0000000..7bac006
+--- /dev/null
++++ b/services/district_match/models.py
+@@ -0,0 +1,53 @@
++"""数据模型定义（引擎输入/输出的轻量容器）。"""
++from dataclasses import dataclass, field
++from typing import Optional
++
++
++@dataclass
++class LevelResult:
++    """单级行政区划匹配结果。
++
++    mapped=True 表示该级代码经历史映射（dm_history_mapping 旧码->新码）命中，
++    用于引擎①匹配过程详情展示（区分“现行直接命中”与“历史映射命中”）。
++    """
++    code: Optional[str] = None
++    name: Optional[str] = None
++    matched: bool = False
++    mapped: bool = False
++
++
++@dataclass
++class Engine1Result:
++    province: LevelResult = field(default_factory=LevelResult)
++    city: LevelResult = field(default_factory=LevelResult)
++    district: LevelResult = field(default_factory=LevelResult)
++    error: Optional[str] = None
++
++
++@dataclass
++class Engine2Result:
++    province: Optional[str] = None
++    city: Optional[str] = None
++    district: Optional[str] = None
++    # 反查得到的 12 位代码
++    district_code: Optional[str] = None
++    city_code: Optional[str] = None
++    province_code: Optional[str] = None
++    # 解析抽取但未直接反查到层级的辅助 token（乡镇/村），供兜底反推
++    township: Optional[str] = None
++    village: Optional[str] = None
++
++
++@dataclass
++class MatchResult:
++    province_code: Optional[str] = None
++    province_name: Optional[str] = None
++    city_code: Optional[str] = None
++    city_name: Optional[str] = None
++    district_code: Optional[str] = None
++    district_name: Optional[str] = None
++    # 状态枚举（v2）：正确 / 已解析 / 已解析(仅证件) / 需复核 / 部分 / 无匹配 / 异常
++    match_status: str = "无匹配"
++    engine1_detail: str = ""
++    engine2_detail: str = ""
++    decision_path: str = ""
+diff --git a/services/district_match/pack.py b/services/district_match/pack.py
+new file mode 100644
+index 0000000..9439446
+--- /dev/null
++++ b/services/district_match/pack.py
+@@ -0,0 +1,91 @@
++"""数据包读取与校验（TSV + gzip，字段顺序锁定）。
++
++格式与文档 4.5 完全一致（6 列）：
++    district_code	district_name	admin_level	parent_code	province_code	city_code
++首行允许 `#` 注释行与表头行。
++
++不引入 pandas：gzip + 标准库 csv 逐行读。
++"""
++import gzip
++import hashlib
++import os
++
++PACK_COLUMNS = (
++    "district_code", "district_name", "admin_level",
++    "parent_code", "province_code", "city_code",
++)
++HEADER_LINE = "\t".join(PACK_COLUMNS)
++
++# 文档 2.4 实测基准（构建脚本产出的包必须与之吻合）
++EXPECTED_LEVEL_COUNTS = {1: 31, 2: 343, 3: 3255, 4: 41274, 5: 619336}
++EXPECTED_TOTAL = 664239
++
++# 由 scripts/build_district_pack.py 产出后回填（见 data/district_pack.sha256）
++EXPECTED_SHA256 = "d1e60bbb0141da282410c618aefecddcb9d8962ab647c7b5ffabbac8451c05f4"
++
++
++def sha256_file(path, chunk=1024 * 1024):
++    """计算文件 sha256（分块读取）。"""
++    h = hashlib.sha256()
++    with open(path, "rb") as f:
++        while True:
++            block = f.read(chunk)
++            if not block:
++                break
++            h.update(block)
++    return h.hexdigest()
++
++
++def iter_pack_rows(path):
++    """迭代数据包，产出 6 元组 (code, name, level, parent_code, province_code, city_code)。"""
++    if not os.path.exists(path):
++        raise FileNotFoundError(f"数据包不存在：{path}")
++    with gzip.open(path, "rt", encoding="utf-8", newline="") as fh:
++        for line in fh:
++            if not line or line.startswith("#"):
++                continue
++            if line.startswith("district_code\t"):
++                continue
++            if not line.strip():
++                continue
++            parts = line.rstrip("\r\n").split("\t")
++            if len(parts) != 6:
++                raise ValueError(
++                    f"数据包列数异常：期望 6 列，实际 {len(parts)} 列 -> {parts[:3]}")
++            yield (
++                parts[0], parts[1], int(parts[2]),
++                parts[3] or None, parts[4] or None, parts[5] or None,
++            )
++
++
++def count_pack(path):
++    """统计数据包总行数与各级行数（验收用）。"""
++    total = 0
++    by_level = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
++    for _code, _name, level, *_rest in iter_pack_rows(path):
++        total += 1
++        by_level[level] = by_level.get(level, 0) + 1
++    return {"total": total, "by_level": by_level}
++
++
++def verify_pack(path, expected=None, check_sha256=True):
++    """校验数据包与文档 2.4 是否一致；返回 (ok, detail)。"""
++    expected = expected or {
++        "total": EXPECTED_TOTAL,
++        "by_level": EXPECTED_LEVEL_COUNTS,
++    }
++    if not os.path.exists(path):
++        return False, {"error": "数据包不存在", "path": path}
++    counts = count_pack(path)
++    detail = dict(counts)
++    detail["sha256"] = sha256_file(path) if check_sha256 else ""
++    detail["size"] = os.path.getsize(path)
++    ok = counts["total"] == expected.get("total")
++    for level, n in (expected.get("by_level") or {}).items():
++        if counts["by_level"].get(level) != n:
++            ok = False
++    exp_sha = expected.get("sha256") or EXPECTED_SHA256
++    if check_sha256 and exp_sha and not exp_sha.startswith("__"):
++        if exp_sha != detail["sha256"]:
++            ok = False
++    return ok, detail
+diff --git a/services/district_match/runner.py b/services/district_match/runner.py
+new file mode 100644
+index 0000000..9f5844e
+--- /dev/null
++++ b/services/district_match/runner.py
+@@ -0,0 +1,137 @@
++"""匹配执行器：串起引擎①/引擎②/决策器，输出 MatchResult 与结果行。
++
++本模块仍属纯算法层：不 import flask / models / config，
++字典与结果表访问全部通过外部注入的 repo（鸭子类型）。
++"""
++from . import engine1, engine2, decider
++from . import validators
++from .models import Engine1Result
++from .constants import ALL_STATUSES
++
++
++def _build_engine1_detail(e1):
++    """构建引擎①过程文本（页面“详情”展示用）。"""
++    if getattr(e1, "error", None):
++        return f"异常：{e1.error}"
++    lines = []
++    lines.append(f"省级：{e1.province.name or '未命中'}（{e1.province.code or '-'}）"
++                 f"{'✅' if e1.province.matched else '❌'}")
++    lines.append(f"市级：{e1.city.name or '未命中'}（{e1.city.code or '-'}）"
++                 f"{'✅' if e1.city.matched else '❌'}")
++    dist_note = "（历史映射）" if getattr(e1.district, "mapped", False) else ""
++    lines.append(f"区县：{e1.district.name or '未命中'}（{e1.district.code or '-'}）"
++                 f"{'✅' if e1.district.matched else '❌'}{dist_note}")
++    return "\n".join(lines)
++
++
++def _build_engine2_detail(e2):
++    """构建引擎②过程文本（页面“详情”展示用）。"""
++    if not e2:
++        return "未执行"
++    lines = []
++    lines.append(f"解析省级：{e2.province or '未解析'}")
++    lines.append(f"解析市级：{e2.city or '未解析'}")
++    lines.append(f"解析区县：{e2.district or '未解析'}")
++    lines.append(f"反查区县代码：{e2.district_code or '未命中'}")
++    return "\n".join(lines)
++
++
++def run_match(repo, id_card, address, with_detail=False):
++    """单条双引擎匹配。
++
++    业务约定：
++    - 证件框可输入完整 18 位身份证 或 6 位区划代码，取前 6 位启动引擎①；
++    - 地址框输入地址即启动引擎②；两框不必都填；
++    - 不做 18 位/校验位强校验（仅以前 6 位作查询入口）；
++    - 证件无效（前 6 位非数字）且地址为空 -> 标“异常”。
++    """
++    id_card = (id_card or "").strip()
++    address = (address or "").strip()
++    first6 = validators.get_id_first6(id_card)
++    if not first6 and not address:
++        from .models import MatchResult
++        return MatchResult(
++            match_status="异常",
++            engine1_detail="未执行",
++            engine2_detail="未执行",
++            decision_path="未输入有效的身份证/区划代码或地址",
++        )
++    e1 = engine1.engine1_match(repo, id_card) if first6 else None
++    e2 = engine2.engine2_parse(repo, address, id_card) if address else None
++    result = decider.dual_engine_decide(repo, e1 or Engine1Result(), e2)
++    if with_detail:
++        result.engine1_detail = (_build_engine1_detail(e1) if e1
++                                 else "未执行（未输入有效的身份证/区划代码）")
++        result.engine2_detail = (_build_engine2_detail(e2) if e2
++                                 else "未执行（未输入地址）")
++    return result
++
++
++def to_district_fields(result):
++    """MatchResult -> students 的 7 个区划列（字段名锁定，不抛异常）。"""
++    return {
++        "district_province_name": result.province_name or "",
++        "district_province_code": result.province_code or "",
++        "district_city_name": result.city_name or "",
++        "district_city_code": result.city_code or "",
++        "district_county_name": result.district_name or "",
++        "district_county_code": result.district_code or "",
++        "district_match_status": result.match_status or "",
++    }
++
++
++def to_result_row(student, result):
++    """MatchResult -> dm_match_result 行（对齐 6.2 DDL）。
++
++    student: 需含 student_id / student_name / id_card / address（可为 None）
++    """
++    return {
++        "student_id": student.get("student_id"),
++        "student_name": student.get("student_name"),
++        "id_card": student.get("id_card"),
++        "address": student.get("address"),
++        "province_code": result.province_code,
++        "province_name": result.province_name,
++        "city_code": result.city_code,
++        "city_name": result.city_name,
++        "district_code": result.district_code,
++        "district_name": result.district_name,
++        "match_status": result.match_status,
++        "engine1_result": result.engine1_detail,
++        "engine2_result": result.engine2_detail,
++        "remark": result.decision_path,
++    }
++
++
++def empty_stats(total=0):
++    stats = {s: 0 for s in ALL_STATUSES}
++    stats["总计"] = total
++    return stats
++
++
++def process_batch(repo, students, batch_id, on_progress=None, progress_interval=200,
++                  source="batch"):
++    """批量匹配并写入 dm_match_result。
++
++    students: 可迭代的学生 dict（student_id/student_name/id_card/address）
++    同一批次重跑会先清空旧结果，避免页面/导出混入旧记录。
++    """
++    students = list(students)
++    repo.delete_results_by_batch(batch_id)
++    total = len(students)
++    stats = empty_stats(total)
++    rows = []
++    for i, stu in enumerate(students):
++        result = run_match(repo, stu.get("id_card"), stu.get("address"),
++                           with_detail=True)
++        row = to_result_row(stu, result)
++        row["batch_id"] = batch_id
++        row["source"] = source
++        rows.append(row)
++        stats[result.match_status] = stats.get(result.match_status, 0) + 1
++        if on_progress and (i + 1) % progress_interval == 0:
++            on_progress(i + 1, total, dict(stats))
++    repo.insert_results_batch(rows)
++    if on_progress:
++        on_progress(total, total, dict(stats))
++    return stats
+diff --git a/services/district_match/validators.py b/services/district_match/validators.py
+new file mode 100644
+index 0000000..a3c91a8
+--- /dev/null
++++ b/services/district_match/validators.py
+@@ -0,0 +1,35 @@
++"""数据校验工具（原样迁移，无外部依赖）。"""
++import re
++
++ID_CARD_RE = re.compile(r"^\d{17}[\dXx]$")
++WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
++CHECK_CODES = ["1", "0", "X", "9", "8", "7", "6", "5", "4", "3", "2"]
++
++
++def is_id_card_format(id_card):
++    """是否符合 18 位身份证格式（前 17 位数字，末位为数字或 X）。"""
++    if not id_card:
++        return False
++    return bool(ID_CARD_RE.match(id_card.strip()))
++
++
++def id_card_checksum_ok(id_card):
++    """校验 18 位身份证校验位是否正确。"""
++    if not is_id_card_format(id_card):
++        return False
++    s = id_card.strip().upper()
++    total = sum(int(s[i]) * WEIGHTS[i] for i in range(17))
++    return CHECK_CODES[total % 11] == s[17]
++
++
++def get_id_first6(id_card):
++    """提取身份证前 6 位；非纯数字返回 None。兼容 6 位区划代码。"""
++    if not id_card or len(id_card) < 6:
++        return None
++    first6 = id_card[:6]
++    return first6 if first6.isdigit() else None
++
++
++def is_first6_numeric(id_card):
++    """前 6 位是否为纯数字。"""
++    return get_id_first6(id_card) is not None
+diff --git a/static/js/district_match.js b/static/js/district_match.js
+new file mode 100644
+index 0000000..5cf7f73
+--- /dev/null
++++ b/static/js/district_match.js
+@@ -0,0 +1,473 @@
++/* 区划匹配页面脚本（外链，CSP 友好；不使用内联事件） */
++(function () {
++    'use strict';
++
++    var app = document.getElementById('dm-app');
++    if (!app) return;
++
++    var URLS = {
++        query: app.dataset.queryUrl,
++        preview: app.dataset.previewUrl,
++        batch: app.dataset.batchUrl,
++        progress: app.dataset.progressUrl,
++        batches: app.dataset.batchesUrl,
++        results: app.dataset.resultsUrl,
++        exportUrl: app.dataset.exportUrl,
++        deleteUrl: app.dataset.deleteUrl,
++        dictionary: app.dataset.dictionaryUrl,
++        dictImport: app.dataset.dictImportUrl,
++        history: app.dataset.historyUrl,
++        backfill: app.dataset.backfillUrl
++    };
++
++    var $ = function (id) { return document.getElementById(id); };
++    var statusClass = {
++        '正确': 'success',
++        '已解析': 'primary',
++        '已解析(仅证件)': 'info',
++        '需复核': 'warning',
++        '部分': 'warning',
++        '无匹配': 'secondary',
++        '异常': 'danger'
++    };
++
++    function withId(template, id) {
++        return template.replace('/0/', '/' + id + '/');
++    }
++
++    function requestJSON(url, options) {
++        return fetch(url, options).then(function (resp) {
++            return safeJSON(resp).then(function (body) {
++                if (!resp.ok || body.success === false) {
++                    var msg = (body && body.message) || ('请求失败（HTTP ' + resp.status + '）');
++                    throw new Error(msg);
++                }
++                return body;
++            });
++        });
++    }
++
++    function cell(text) {
++        var td = document.createElement('td');
++        td.textContent = text === null || text === undefined ? '' : String(text);
++        return td;
++    }
++
++    function badge(status) {
++        var span = document.createElement('span');
++        span.className = 'badge text-bg-' + (statusClass[status] || 'secondary');
++        span.textContent = status || '未计算';
++        return span;
++    }
++
++    function setBusy(button, busy, text) {
++        if (!button) return;
++        button.disabled = busy;
++        if (busy) {
++            button.dataset.original = button.textContent;
++            button.textContent = text || '处理中…';
++        } else if (button.dataset.original) {
++            button.textContent = button.dataset.original;
++        }
++    }
++
++    /* ---------------------------------------------------------- 1. 单条查询 */
++    $('dm-query-form').addEventListener('submit', function (event) {
++        event.preventDefault();
++        var idCard = $('dm-id-card').value.trim();
++        var address = $('dm-address').value.trim();
++        if (!idCard && !address) {
++            showToast('请输入身份证号或地址', 'warning');
++            return;
++        }
++        var btn = $('dm-query-btn');
++        setBusy(btn, true, '查询中…');
++        requestJSON(URLS.query, {
++            method: 'POST',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ id_card: idCard, address: address })
++        }).then(function (body) {
++            var data = body.data || {};
++            var fields = $('dm-query-fields').querySelectorAll('[data-key]');
++            Array.prototype.forEach.call(fields, function (dd) {
++                dd.textContent = data[dd.dataset.key] || '-';
++            });
++            var summary = $('dm-query-summary');
++            summary.textContent = '匹配状态：' + (data.match_status || '-') +
++                '　说明：' + (data.decision_path || '-');
++            $('dm-detail').textContent =
++                '【引擎①】\n' + (data.engine1_detail || '-') +
++                '\n\n【引擎②】\n' + (data.engine2_detail || '-');
++        }).catch(function (err) {
++            showToast(err.message, 'danger');
++        }).finally(function () {
++            setBusy(btn, false);
++        });
++    });
++
++    /* ---------------------------------------------------------- 2. 批量匹配 */
++    var headers = [];
++
++    function fillSelect(select, list, selected) {
++        select.innerHTML = '';
++        var empty = document.createElement('option');
++        empty.value = '';
++        empty.textContent = '（不选择）';
++        select.appendChild(empty);
++        list.forEach(function (name) {
++            var option = document.createElement('option');
++            option.value = name;
++            option.textContent = name;
++            if (name === selected) option.selected = true;
++            select.appendChild(option);
++        });
++    }
++
++    $('dm-source-upload').addEventListener('change', toggleSource);
++    $('dm-source-students').addEventListener('change', toggleSource);
++
++    function toggleSource() {
++        var isUpload = $('dm-source-upload').checked;
++        $('dm-upload-panel').classList.toggle('d-none', !isUpload);
++        $('dm-students-panel').classList.toggle('d-none', isUpload);
++    }
++
++    $('dm-preview-btn').addEventListener('click', function () {
++        var file = $('dm-file').files[0];
++        if (!file) {
++            showToast('请先选择文件', 'warning');
++            return;
++        }
++        var form = new FormData();
++        form.append('file', file);
++        var btn = $('dm-preview-btn');
++        setBusy(btn, true, '解析中…');
++        requestJSON(URLS.preview, { method: 'POST', body: form }).then(function (body) {
++            var data = body.data || {};
++            headers = data.headers || [];
++            fillSelect($('dm-col-id'), headers, data.suggest && data.suggest.id_card);
++            fillSelect($('dm-col-addr'), headers, data.suggest && data.suggest.address);
++            renderPreview(headers, data.rows || []);
++            $('dm-preview-hint').textContent = '共读取 ' + (data.rows || []).length + ' 行预览';
++        }).catch(function (err) {
++            showToast(err.message, 'danger');
++        }).finally(function () {
++            setBusy(btn, false);
++        });
++    });
++
++    function renderPreview(cols, rows) {
++        var table = $('dm-preview-table');
++        var thead = table.querySelector('thead');
++        var tbody = table.querySelector('tbody');
++        thead.innerHTML = '';
++        tbody.innerHTML = '';
++        var tr = document.createElement('tr');
++        cols.forEach(function (name) { tr.appendChild(cell(name)); });
++        thead.appendChild(tr);
++        rows.forEach(function (row) {
++            var line = document.createElement('tr');
++            cols.forEach(function (name) { line.appendChild(cell(row[name])); });
++            tbody.appendChild(line);
++        });
++        $('dm-preview-wrap').classList.remove('d-none');
++    }
++
++    $('dm-batch-btn').addEventListener('click', function () {
++        var isUpload = $('dm-source-upload').checked;
++        var btn = $('dm-batch-btn');
++        var options;
++        if (isUpload) {
++            var file = $('dm-file').files[0];
++            if (!file) {
++                showToast('请先选择文件', 'warning');
++                return;
++            }
++            var idCol = $('dm-col-id').value;
++            var addrCol = $('dm-col-addr').value;
++            if (!idCol && !addrCol) {
++                showToast('请选择身份证列或地址列', 'warning');
++                return;
++            }
++            var form = new FormData();
++            form.append('file', file);
++            form.append('id_card_col', idCol);
++            form.append('address_col', addrCol);
++            options = { method: 'POST', body: form };
++        } else {
++            options = {
++                method: 'POST',
++                headers: { 'Content-Type': 'application/json' },
++                body: JSON.stringify({ source: 'students' })
++            };
++        }
++        setBusy(btn, true, '启动中…');
++        requestJSON(URLS.batch, options).then(function (body) {
++            pollProgress(body.data.progress_id, function (item) {
++                $('dm-progress-wrap').classList.remove('d-none');
++                updateProgress(item);
++            }, function (item) {
++                $('dm-progress-wrap').classList.remove('d-none');
++                updateProgress(item);
++                if (item.status === 'error') {
++                    showToast(item.message || '批量匹配失败', 'danger');
++                    return;
++                }
++                showToast('批量匹配完成', 'success');
++                if (item.result && item.result.batch_id) {
++                    loadResults(item.result.batch_id);
++                }
++                loadBatches();
++            });
++        }).catch(function (err) {
++            showToast(err.message, 'danger');
++        }).finally(function () {
++            setBusy(btn, false);
++        });
++    });
++
++    function updateProgress(item) {
++        var percent = item.total ? Math.round(item.done * 100 / item.total) : 0;
++        var bar = $('dm-progress-bar');
++        bar.style.width = percent + '%';
++        bar.textContent = percent + '%';
++        $('dm-progress-text').textContent =
++            (item.phase ? '[' + item.phase + '] ' : '') +
++            (item.message || '') + '（' + item.done + '/' + item.total + '）';
++    }
++
++    function pollProgress(progressId, onTick, onDone) {
++        var url = URLS.progress.replace('__PID__', progressId);
++        var timer = setInterval(function () {
++            requestJSON(url, { method: 'GET' }).then(function (body) {
++                var item = body.data || {};
++                onTick(item);
++                if (item.status !== 'running') {
++                    clearInterval(timer);
++                    onDone(item);
++                }
++            }).catch(function (err) {
++                clearInterval(timer);
++                showToast(err.message, 'danger');
++            });
++        }, 1000);
++    }
++
++    function loadResults(batchId) {
++        requestJSON(withId(URLS.results, batchId) + '?size=100', { method: 'GET' })
++            .then(function (body) {
++                var data = body.data || {};
++                var tbody = $('dm-result-table').querySelector('tbody');
++                tbody.innerHTML = '';
++                (data.items || []).forEach(function (item) {
++                    var tr = document.createElement('tr');
++                    tr.appendChild(cell(item.student_name));
++                    tr.appendChild(cell(item.id_card));
++                    tr.appendChild(cell(item.address));
++                    tr.appendChild(cell(item.province_name));
++                    tr.appendChild(cell(item.city_name));
++                    tr.appendChild(cell(item.district_name));
++                    var td = document.createElement('td');
++                    td.appendChild(badge(item.match_status));
++                    tr.appendChild(td);
++                    tr.appendChild(cell(item.decision_path));
++                    tbody.appendChild(tr);
++                });
++                var batch = data.batch || {};
++                $('dm-result-title').textContent =
++                    '批次 ' + (batch.batch_no || batchId) + '，共 ' + (data.total || 0) + ' 条，当前显示前 100 条';
++                var link = $('dm-export-link');
++                link.href = withId(URLS.exportUrl, batchId) + '?format=xlsx';
++                link.classList.remove('d-none');
++                $('dm-result-wrap').classList.remove('d-none');
++            }).catch(function (err) {
++                showToast(err.message, 'danger');
++            });
++    }
++
++    /* ---------------------------------------------------------- 3. 批次记录 */
++    function loadBatches() {
++        requestJSON(URLS.batches + '?size=20', { method: 'GET' }).then(function (body) {
++            var data = body.data || {};
++            var tbody = $('dm-batch-table').querySelector('tbody');
++            tbody.innerHTML = '';
++            (data.items || []).forEach(function (item) {
++                var tr = document.createElement('tr');
++                tr.appendChild(cell(item.batch_no));
++                tr.appendChild(cell(item.source));
++                tr.appendChild(cell(item.total));
++                var tdStatus = document.createElement('td');
++                tdStatus.textContent = item.status || '';
++                tr.appendChild(tdStatus);
++                tr.appendChild(cell(item.created_by));
++                tr.appendChild(cell(item.created_at));
++
++                var td = document.createElement('td');
++                td.className = 'text-end';
++                var view = document.createElement('button');
++                view.type = 'button';
++                view.className = 'btn btn-outline-primary btn-sm me-1';
++                view.textContent = '查看';
++                view.addEventListener('click', function () { loadResults(item.id); });
++                td.appendChild(view);
++
++                var exportBtn = document.createElement('a');
++                exportBtn.className = 'btn btn-outline-success btn-sm me-1';
++                exportBtn.textContent = '导出';
++                exportBtn.href = withId(URLS.exportUrl, item.id) + '?format=xlsx';
++                td.appendChild(exportBtn);
++
++                var del = document.createElement('button');
++                del.type = 'button';
++                del.className = 'btn btn-outline-danger btn-sm';
++                del.textContent = '删除';
++                del.addEventListener('click', function () {
++                    showConfirm('确认删除批次 ' + item.batch_no + '？结果将软删除。', 'danger')
++                        .then(function (ok) {
++                            if (!ok) return;
++                            requestJSON(withId(URLS.deleteUrl, item.id), { method: 'POST' })
++                                .then(function () {
++                                    showToast('已删除', 'success');
++                                    loadBatches();
++                                    $('dm-result-wrap').classList.add('d-none');
++                                }).catch(function (err) { showToast(err.message, 'danger'); });
++                        });
++                });
++                td.appendChild(del);
++                tr.appendChild(td);
++                tbody.appendChild(tr);
++            });
++        }).catch(function (err) {
++            showToast(err.message, 'danger');
++        });
++    }
++
++    $('dm-batches-refresh').addEventListener('click', loadBatches);
++
++    /* ---------------------------------------------------------- 4. 字典状态 */
++    function loadDictionary(verify) {
++        var url = URLS.dictionary + (verify ? '?verify=1' : '');
++        requestJSON(url, { method: 'GET' }).then(function (body) {
++            var data = body.data || {};
++            renderDictionary(data);
++        }).catch(function (err) {
++            showToast(err.message, 'danger');
++        });
++    }
++
++    function line(label, value) {
++        var row = document.createElement('div');
++        row.className = 'd-flex justify-content-between border-bottom py-1';
++        var left = document.createElement('span');
++        left.className = 'text-muted';
++        left.textContent = label;
++        var right = document.createElement('span');
++        right.textContent = value;
++        row.appendChild(left);
++        row.appendChild(right);
++        return row;
++    }
++
++    function renderDictionary(data) {
++        var box = $('dm-dict-body');
++        box.innerHTML = '';
++        var byLevel = data.by_level || {};
++        var levelText = Object.keys(byLevel).sort().map(function (key) {
++            return 'L' + key + ' ' + byLevel[key];
++        }).join(' / ') || '-';
++        box.appendChild(line('字典库', data.db_exists ? '已就绪' : '未导入'));
++        box.appendChild(line('总行数', String(data.total || 0)));
++        box.appendChild(line('各级行数', levelText));
++        box.appendChild(line('库文件大小', ((data.db_size || 0) / 1024 / 1024).toFixed(1) + ' MB'));
++        box.appendChild(line('更新时间', data.updated_at || '-'));
++        var cache = data.cache || {};
++        box.appendChild(line('内存缓存', cache.ready ? (cache.rows + ' 行（L1–L4）') : '未加载'));
++        var pack = data.pack || {};
++        box.appendChild(line('数据包', pack.exists ? ((pack.size / 1024 / 1024).toFixed(2) + ' MB') : '缺失'));
++        if (pack.sha256) {
++            box.appendChild(line('sha256', pack.sha256.slice(0, 16) + '…'));
++        }
++        if (pack.verify_ok !== undefined) {
++            box.appendChild(line('数据包校验', pack.verify_ok ? '通过（行数一致）' : '不一致'));
++        }
++    }
++
++    $('dm-refresh-dict').addEventListener('click', function () { loadDictionary(true); });
++
++    $('dm-dict-import-btn').addEventListener('click', function () {
++        showConfirm('导入会清空并重灌字典表（运行期只读库），确认继续？', 'warn')
++            .then(function (ok) {
++                if (!ok) return;
++                var btn = $('dm-dict-import-btn');
++                setBusy(btn, true, '启动中…');
++                requestJSON(URLS.dictImport, { method: 'POST' })
++                    .then(function (body) {
++                        $('dm-progress-wrap').classList.remove('d-none');
++                        pollProgress(body.data.progress_id, updateProgress, function (item) {
++                            updateProgress(item);
++                            setBusy(btn, false);
++                            if (item.status === 'error') {
++                                showToast(item.message || '导入失败', 'danger');
++                            } else {
++                                showToast('字典导入完成', 'success');
++                                loadDictionary(true);
++                            }
++                        });
++                    }).catch(function (err) {
++                        setBusy(btn, false);
++                        showToast(err.message, 'danger');
++                    });
++            });
++    });
++
++    function loadHistory() {
++        requestJSON(URLS.history, { method: 'GET' }).then(function (body) {
++            var tbody = $('dm-history-table').querySelector('tbody');
++            tbody.innerHTML = '';
++            ((body.data || {}).items || []).forEach(function (item) {
++                var tr = document.createElement('tr');
++                tr.appendChild(cell(item.old_code));
++                tr.appendChild(cell(item.old_name));
++                tr.appendChild(cell(item.new_code));
++                tr.appendChild(cell(item.new_name));
++                tbody.appendChild(tr);
++            });
++        }).catch(function (err) {
++            showToast(err.message, 'danger');
++        });
++    }
++
++    /* ---------------------------------------------------------- 批量补全 */
++    $('dm-backfill-btn').addEventListener('click', function () {
++        showConfirm('将按地址/身份证为“区县代码为空”的学生补全 7 列（最多 5000 条，不改更新时间）。确认继续？', 'warn')
++            .then(function (ok) {
++                if (!ok) return;
++                var btn = $('dm-backfill-btn');
++                setBusy(btn, true, '启动中…');
++                requestJSON(URLS.backfill, {
++                    method: 'POST',
++                    headers: { 'Content-Type': 'application/json' },
++                    body: JSON.stringify({ only_empty: true, limit: 5000 })
++                }).then(function (body) {
++                    $('dm-progress-wrap').classList.remove('d-none');
++                    pollProgress(body.data.progress_id, updateProgress, function (item) {
++                        updateProgress(item);
++                        setBusy(btn, false);
++                        if (item.status === 'error') {
++                            showToast(item.message || '回填失败', 'danger');
++                        } else {
++                            var res = item.result || {};
++                            showToast('回填完成：更新 ' + (res.updated || 0) + ' 条', 'success');
++                        }
++                    });
++                }).catch(function (err) {
++                    setBusy(btn, false);
++                    showToast(err.message, 'danger');
++                });
++            });
++    });
++
++    loadBatches();
++    loadDictionary(false);
++    loadHistory();
++})();
+diff --git a/templates/admin/district_match.html b/templates/admin/district_match.html
+new file mode 100644
+index 0000000..07defe6
+--- /dev/null
++++ b/templates/admin/district_match.html
+@@ -0,0 +1,216 @@
++{% extends "base.html" %}
++{% block title %}区划匹配{% endblock %}
++
++{% block content %}
++<div class="container-fluid py-3" id="dm-app"
++     data-query-url="{{ url_for('district_match.query') }}"
++     data-preview-url="{{ url_for('district_match.preview') }}"
++     data-batch-url="{{ url_for('district_match.batch') }}"
++     data-progress-url="{{ url_for('district_match.progress', progress_id='__PID__') }}"
++     data-batches-url="{{ url_for('district_match.batches') }}"
++     data-results-url="{{ url_for('district_match.results', batch_id=0) }}"
++     data-export-url="{{ url_for('district_match.export_batch', batch_id=0) }}"
++     data-delete-url="{{ url_for('district_match.delete_batch', batch_id=0) }}"
++     data-dictionary-url="{{ url_for('district_match.dictionary') }}"
++     data-dict-import-url="{{ url_for('district_match.dictionary_import') }}"
++     data-history-url="{{ url_for('district_match.history') }}"
++     data-backfill-url="{{ url_for('district_match.backfill') }}">
++
++  <div class="d-flex flex-wrap justify-content-between align-items-center mb-3 gap-2">
++    <div>
++      <h4 class="mb-1"><i class="bi bi-geo-alt"></i> 区划匹配</h4>
++      <div class="text-muted small">身份证前 6 位 + 地址文本双引擎匹配；结果写入批次记录，不直接改学生主表（除“批量补全区划”）。</div>
++    </div>
++    <div class="d-flex gap-2">
++      <button type="button" class="btn btn-outline-secondary btn-sm" id="dm-refresh-dict">
++        <i class="bi bi-arrow-clockwise"></i> 刷新字典状态
++      </button>
++      <button type="button" class="btn btn-outline-primary btn-sm" id="dm-backfill-btn" data-limit="5000">
++        <i class="bi bi-magic"></i> 批量补全区划（≤5000）
++      </button>
++    </div>
++  </div>
++
++  <div class="row g-3">
++    <!-- 1. 单条查询 -->
++    <div class="col-12 col-xl-5">
++      <div class="card h-100">
++        <div class="card-header"><i class="bi bi-search"></i> 单条查询</div>
++        <div class="card-body">
++          <form id="dm-query-form" autocomplete="off">
++            <div class="mb-2">
++              <label class="form-label small text-muted" for="dm-id-card">身份证号（或 6 位区划代码）</label>
++              <input type="text" class="form-control" id="dm-id-card" maxlength="18"
++                     placeholder="可留空，与地址二选一">
++            </div>
++            <div class="mb-2">
++              <label class="form-label small text-muted" for="dm-address">地址</label>
++              <textarea class="form-control" id="dm-address" rows="2"
++                        placeholder="例：黑龙江省哈尔滨市道外区××街道"></textarea>
++            </div>
++            <button type="submit" class="btn btn-primary btn-sm" id="dm-query-btn">
++              <i class="bi bi-search"></i> 查询
++            </button>
++          </form>
++          <hr>
++          <div id="dm-query-summary" class="mb-2 text-muted small">尚未查询</div>
++          <dl class="row mb-0 small" id="dm-query-fields">
++            <dt class="col-5">省</dt><dd class="col-7" data-key="district_province_name">-</dd>
++            <dt class="col-5">省代码</dt><dd class="col-7" data-key="district_province_code">-</dd>
++            <dt class="col-5">市</dt><dd class="col-7" data-key="district_city_name">-</dd>
++            <dt class="col-5">市代码</dt><dd class="col-7" data-key="district_city_code">-</dd>
++            <dt class="col-5">县</dt><dd class="col-7" data-key="district_county_name">-</dd>
++            <dt class="col-5">县代码</dt><dd class="col-7" data-key="district_county_code">-</dd>
++            <dt class="col-5">匹配状态</dt><dd class="col-7" data-key="district_match_status">-</dd>
++          </dl>
++          <div class="mt-2">
++            <div class="small text-muted">引擎过程</div>
++            <pre class="small bg-light border rounded p-2 mb-0" id="dm-detail" style="white-space:pre-wrap;"></pre>
++          </div>
++        </div>
++      </div>
++    </div>
++
++    <!-- 2. 批量匹配 -->
++    <div class="col-12 col-xl-7">
++      <div class="card h-100">
++        <div class="card-header"><i class="bi bi-collection"></i> 批量匹配</div>
++        <div class="card-body">
++          <div class="btn-group btn-group-sm mb-3" role="group">
++            <input type="radio" class="btn-check" name="dm-source" id="dm-source-upload" value="upload" checked>
++            <label class="btn btn-outline-secondary" for="dm-source-upload">上传清单</label>
++            <input type="radio" class="btn-check" name="dm-source" id="dm-source-students" value="students">
++            <label class="btn btn-outline-secondary" for="dm-source-students">取在校学生</label>
++          </div>
++
++          <div id="dm-upload-panel">
++            <div class="row g-2 align-items-end">
++              <div class="col-12 col-md-6">
++                <label class="form-label small text-muted" for="dm-file">清单文件（xlsx / csv，≤10MB）</label>
++                <input type="file" class="form-control form-control-sm" id="dm-file" accept=".xlsx,.xlsm,.csv">
++              </div>
++              <div class="col-6 col-md-3">
++                <label class="form-label small text-muted" for="dm-col-id">身份证列</label>
++                <select class="form-select form-select-sm" id="dm-col-id"></select>
++              </div>
++              <div class="col-6 col-md-3">
++                <label class="form-label small text-muted" for="dm-col-addr">地址列</label>
++                <select class="form-select form-select-sm" id="dm-col-addr"></select>
++              </div>
++            </div>
++            <div class="mt-2">
++              <button type="button" class="btn btn-outline-primary btn-sm" id="dm-preview-btn">
++                <i class="bi bi-eye"></i> 预览前 10 行
++              </button>
++              <span class="text-muted small ms-2" id="dm-preview-hint">先选文件再预览，确认列映射后开始匹配</span>
++            </div>
++            <div class="table-responsive mt-2 d-none" id="dm-preview-wrap">
++              <table class="table table-sm table-bordered align-middle mb-0" id="dm-preview-table">
++                <thead></thead><tbody></tbody>
++              </table>
++            </div>
++          </div>
++
++          <div id="dm-students-panel" class="d-none">
++            <div class="alert alert-light border small mb-0">
++              将按“在校且未删除”口径（复用 <code>_non_graduated_where()</code>）取出学生，逐条匹配后写批次记录。
++              不修改学生主表。
++            </div>
++          </div>
++
++          <div class="mt-3">
++            <button type="button" class="btn btn-primary btn-sm" id="dm-batch-btn">
++              <i class="bi bi-play-fill"></i> 开始匹配
++            </button>
++          </div>
++
++          <div class="mt-3 d-none" id="dm-progress-wrap">
++            <div class="progress" style="height: 18px;">
++              <div class="progress-bar" id="dm-progress-bar" role="progressbar" style="width: 0%"></div>
++            </div>
++            <div class="small text-muted mt-1" id="dm-progress-text"></div>
++          </div>
++
++          <div class="mt-3 d-none" id="dm-result-wrap">
++            <div class="d-flex justify-content-between align-items-center mb-2">
++              <div class="small text-muted" id="dm-result-title"></div>
++              <div class="d-flex gap-2">
++                <a class="btn btn-outline-success btn-sm d-none" id="dm-export-link" href="#">
++                  <i class="bi bi-download"></i> 导出
++                </a>
++              </div>
++            </div>
++            <div class="table-responsive" style="max-height: 320px;">
++              <table class="table table-sm table-hover align-middle mb-0" id="dm-result-table">
++                <thead class="table-light">
++                  <tr>
++                    <th>姓名</th><th>身份证</th><th>地址</th>
++                    <th>省</th><th>市</th><th>县</th><th>状态</th><th>说明</th>
++                  </tr>
++                </thead>
++                <tbody></tbody>
++              </table>
++            </div>
++          </div>
++        </div>
++      </div>
++    </div>
++
++    <!-- 3. 批次记录 -->
++    <div class="col-12 col-xl-7">
++      <div class="card">
++        <div class="card-header d-flex justify-content-between align-items-center">
++          <span><i class="bi bi-clock-history"></i> 批次记录</span>
++          <button type="button" class="btn btn-outline-secondary btn-sm" id="dm-batches-refresh">
++            <i class="bi bi-arrow-clockwise"></i> 刷新
++          </button>
++        </div>
++        <div class="card-body p-0">
++          <div class="table-responsive">
++            <table class="table table-sm table-hover align-middle mb-0" id="dm-batch-table">
++              <thead class="table-light">
++                <tr><th>批次号</th><th>来源</th><th>总数</th><th>状态</th><th>创建人</th><th>时间</th><th class="text-end">操作</th></tr>
++              </thead>
++              <tbody></tbody>
++            </table>
++          </div>
++        </div>
++      </div>
++    </div>
++
++    <!-- 4. 字典状态 + 历史映射 -->
++    <div class="col-12 col-xl-5">
++      <div class="card mb-3">
++        <div class="card-header d-flex justify-content-between align-items-center">
++          <span><i class="bi bi-database-check"></i> 字典状态</span>
++          <button type="button" class="btn btn-outline-primary btn-sm" id="dm-dict-import-btn">
++            <i class="bi bi-box-arrow-in-down"></i> 导入数据包
++          </button>
++        </div>
++        <div class="card-body small" id="dm-dict-body">
++          <div class="text-muted">加载中…</div>
++        </div>
++      </div>
++
++      <div class="card">
++        <div class="card-header"><i class="bi bi-signpost-split"></i> 历史映射（只读）</div>
++        <div class="card-body p-0">
++          <div class="table-responsive" style="max-height: 240px;">
++            <table class="table table-sm mb-0" id="dm-history-table">
++              <thead class="table-light"><tr><th>旧码</th><th>旧名</th><th>新码</th><th>新名</th></tr></thead>
++              <tbody></tbody>
++            </table>
++          </div>
++          <div class="small text-muted p-2 border-top">
++            本期只读展示；增删改留到有明确需求时再做（15.2 #6）。
++          </div>
++        </div>
++      </div>
++    </div>
++  </div>
++</div>
++{% endblock %}
++
++{% block scripts %}
++<script src="{{ url_for('static', filename='js/district_match.js') }}" defer></script>
++{% endblock %}
+diff --git a/templates/base.html b/templates/base.html
+index 286d151..fe6c7c5 100644
+--- a/templates/base.html
++++ b/templates/base.html
+@@ -62,6 +62,9 @@
+                             <li><a class="dropdown-item" href="{{ url_for('lifecycle.admin_graduation_query') }}">
+                                 <i class="bi bi-search"></i> 毕业生查询
+                             </a></li>
++                            <li><a class="dropdown-item" href="{{ url_for('district_match.page') }}">
++                                <i class="bi bi-geo-alt-fill"></i> 区划匹配
++                            </a></li>
+                             <li><hr class="dropdown-divider"></li>
+                             <li><a class="dropdown-item" href="{{ url_for('admin.admin_import') }}">
+                                 <i class="bi bi-file-earmark-plus"></i> 批量新增
+diff --git a/tests/conftest.py b/tests/conftest.py
+index b311b48..1561ea0 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -59,6 +59,8 @@ def _cleanup_db(db_conn):
+         'attendance_records', 'attendance_dates', 'update_logs',
+         'export_history', 'export_field_mappings', 'export_templates',
+         'dicts', 'students', 'users',
++        # 区划匹配结果表（幂等清空；字典历史映射种子不动）
++        'dm_match_result', 'dm_match_batch',
+     ]
+     try:
+         for table in tables_to_clean:
+diff --git a/tests/test_district_match_repo.py b/tests/test_district_match_repo.py
+new file mode 100644
+index 0000000..78a1e43
+--- /dev/null
++++ b/tests/test_district_match_repo.py
+@@ -0,0 +1,192 @@
++# -*- coding: utf-8 -*-
++"""Repository / 录入联动 / 缓存 测试（依赖目标项目 fixture）。
++
++运行：
++    python -m pytest tests/test_district_match_repo.py -q
++"""
++import gzip
++import os
++import time
++
++import pytest
++
++from models import district as dm
++from services.district_match import pack as pack_mod
++
++ROWS = [
++    ("110000000000", "北京市", 1, "", "110000000000", ""),
++    ("110100000000", "市辖区", 2, "110000000000", "110000000000", "110100000000"),
++    ("110108000000", "海淀区", 3, "110100000000", "110000000000", "110100000000"),
++    ("230000000000", "黑龙江省", 1, "", "230000000000", ""),
++    ("230100000000", "哈尔滨市", 2, "230000000000", "230000000000", "230100000000"),
++    ("230104000000", "道外区", 3, "230100000000", "230000000000", "230100000000"),
++    ("230104001000", "水泥路街道", 4, "230104000000", "230000000000", "230100000000"),
++    ("230104001001", "水泥路社区", 5, "230104001000", "230000000000", "230100000000"),
++    ("231100000000", "黑河市", 2, "230000000000", "230000000000", "231100000000"),
++    ("231183000000", "嫩江市", 3, "231100000000", "230000000000", "231100000000"),
++]
++
++
++def _write_pack(path):
++    with open(path, "wb") as raw:
++        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
++            gz.write(("district_code\tdistrict_name\tadmin_level\tparent_code\t"
++                      "province_code\tcity_code\n").encode("utf-8"))
++            for row in ROWS:
++                gz.write(("\t".join(str(x) for x in row) + "\n").encode("utf-8"))
++    return path
++
++
++@pytest.fixture(scope="module")
++def loaded_dict(tmp_path_factory):
++    """导入小数据包到临时 district.db，并在用例结束后清理缓存。"""
++    tmp = tmp_path_factory.mktemp("dmpack")
++    path = _write_pack(str(tmp / "district_pack.tsv.gz"))
++    dm.import_dictionary(pack_file=path)
++    yield path
++    dm.invalidate_cache()
++
++
++def test_pack_counts(loaded_dict):
++    counts = pack_mod.count_pack(loaded_dict)
++    assert counts["total"] == len(ROWS)
++    assert counts["by_level"][5] == 1
++    assert len(pack_mod.sha256_file(loaded_dict)) == 64
++
++
++def test_repository_queries(loaded_dict):
++    repo = dm.DistrictRepository()
++    assert repo.get_by_district_code("230104000000", 3)["district_name"] == "道外区"
++    assert repo.get_by_id("230100000000")["district_name"] == "哈尔滨市"
++    assert repo.reverse_lookup("道外区", 3)["district_code"] == "230104000000"
++    assert repo.reverse_lookup("水泥路社区", 5)["district_code"] == "230104001001"
++    assert repo.search_by_name("道外区", 3)[0]["district_code"] == "230104000000"
++
++
++def test_warm_cache_loaded(loaded_dict):
++    info = dm.warm_cache()
++    assert info["ready"] is True
++    assert info["rows"] == 9          # L1–L4 共 9 行（ROWS 中 level<=4）
++    assert info["history_rows"] >= 0
++
++
++def test_fill_district_fields_inplace(loaded_dict):
++    data = {"id_card": "230104199001010011",
++            "address": "黑龙江省哈尔滨市道外区水泥路1号"}
++    out = dm.fill_district_fields(data)
++    assert out is data
++    assert data["district_province_name"] == "黑龙江省"
++    assert data["district_province_code"] == "230000000000"
++    assert data["district_city_name"] == "哈尔滨市"
++    assert data["district_county_name"] == "道外区"
++    assert data["district_county_code"] == "230104000000"
++    assert data["district_match_status"] in ("正确", "已解析")
++
++
++def test_fill_never_raises_when_dict_missing(monkeypatch, tmp_path):
++    """字典缺失：7 键留空且不抛异常（12.2 #29）。"""
++    monkeypatch.setattr(dm, "DISTRICT_DB_PATH", str(tmp_path / "missing.db"))
++    dm.invalidate_cache()
++    data = {"id_card": "230104199001010011", "address": "黑龙江省哈尔滨市道外区"}
++    out = dm.fill_district_fields(data)
++    assert out is data
++    for key in dm.DISTRICT_FIELDS:
++        assert data[key] == ""
++    dm.invalidate_cache()
++
++
++def test_fill_fields_no_conn_writes(loaded_dict):
++    """纯内存：调用前后 students 行数不变、连接无未提交写事务。"""
++    conn = dm.get_db()
++    before = conn.execute("SELECT COUNT(1) FROM students").fetchone()[0]
++    dm.fill_district_fields({"id_card": "230104", "address": ""})
++    after = conn.execute("SELECT COUNT(1) FROM students").fetchone()[0]
++    assert before == after
++
++
++def test_fill_many_perf(loaded_dict):
++    """3000 行批量补全：一次预热 + 循环内存匹配，单行 < 20 ms（12.2 #30）。"""
++    dm.warm_cache()
++    rows = [{"id_card": "230104199001010011",
++             "address": "黑龙江省哈尔滨市道外区水泥路1号"} for _ in range(3000)]
++    started = time.perf_counter()
++    dm.fill_district_fields_many(rows)
++    elapsed = time.perf_counter() - started
++    per_row_ms = elapsed * 1000 / len(rows)
++    assert all(r["district_county_code"] == "230104000000" for r in rows)
++    assert per_row_ms < 20, "单行 %.2f ms 超过 20 ms" % per_row_ms
++    print("\n3000 行耗时 %.3fs，单行 %.3f ms" % (elapsed, per_row_ms))
++
++
++def test_ensure_student_district_only_writes_result(loaded_dict, db_conn):
++    from models.students import create_student
++
++    student_id = create_student({
++        "name": "区划测试生", "student_no": "DM0001", "id_card": "230104199001010011",
++        "address": "黑龙江省哈尔滨市道外区水泥路1号", "gender": "男",
++        "school": 1, "enrollment_year": 2026, "grade": "1", "admin_class": "1班",
++        "registration_status": "正式学籍", "attendance_status": "在校",
++    })
++    before = db_conn.execute(
++        "SELECT district_county_code, district_match_status FROM students WHERE id = ?",
++        (student_id,)).fetchone()
++    assert before[0] == "230104000000"
++
++    # 人为清空 7 列，验证 ensure 不回写 students
++    db_conn.execute(
++        "UPDATE students SET district_province_name='', district_province_code='', "
++        "district_city_name='', district_city_code='', district_county_name='', "
++        "district_county_code='', district_match_status='' WHERE id = ?", (student_id,))
++    db_conn.commit()
++
++    data = dm.ensure_student_district(student_id, refresh=True)
++    assert data["district_county_code"] == "230104000000"
++    after = db_conn.execute(
++        "SELECT district_county_code FROM students WHERE id = ?", (student_id,)).fetchone()
++    assert after[0] == ""
++    result = db_conn.execute(
++        "SELECT COUNT(1) FROM dm_match_result WHERE student_id = ? AND source='on_demand'",
++        (student_id,)).fetchone()
++    assert result[0] == 1
++
++
++def test_get_student_district_prefers_students(loaded_dict, db_conn):
++    db_conn.execute(
++        "INSERT INTO students (name, id_card, address, district_province_name, "
++        "district_province_code, district_city_name, district_city_code, "
++        "district_county_name, district_county_code, district_match_status, "
++        "school, enrollment_year, registration_status, attendance_status) "
++        "VALUES ('甲', '230104199001010022', '', '黑龙江省', '230000000000', "
++        "'哈尔滨市', '230100000000', '道外区', '230104000000', '正确', 1, 2026, "
++        "'正式学籍', '在校')")
++    db_conn.commit()
++    row = db_conn.execute("SELECT id FROM students WHERE id_card='230104199001010022'").fetchone()
++    data = dm.get_student_district(student_id=row[0])
++    assert data["source"] == "students"
++    assert data["district_county_code"] == "230104000000"
++
++
++def test_backfill_only_empty_keeps_values(loaded_dict, db_conn):
++    db_conn.execute(
++        "INSERT INTO students (name, id_card, address, district_county_code, "
++        "school, enrollment_year, registration_status, attendance_status) "
++        "VALUES ('乙', '230104199001010033', '黑龙江省哈尔滨市道外区', '', 1, 2026, "
++        "'正式学籍', '在校')")
++    db_conn.execute(
++        "INSERT INTO students (name, id_card, address, district_county_code, "
++        "school, enrollment_year, registration_status, attendance_status) "
++        "VALUES ('丙', '110108199001010044', '', '110108000000', 1, 2026, "
++        "'正式学籍', '在校')")
++    db_conn.commit()
++    before = db_conn.execute(
++        "SELECT district_county_code, district_province_name FROM students "
++        "WHERE name='丙'").fetchone()
++    result = dm.backfill_students(only_empty=True, limit=100)
++    assert result["updated"] >= 1
++    after = db_conn.execute(
++        "SELECT district_county_code, district_province_name FROM students "
++        "WHERE name='丙'").fetchone()
++    assert tuple(after) == tuple(before)
++    filled = db_conn.execute(
++        "SELECT district_county_code FROM students WHERE name='乙'").fetchone()
++    assert filled[0] == "230104000000"
+diff --git a/tests/test_district_match_unit.py b/tests/test_district_match_unit.py
+new file mode 100644
+index 0000000..4f9ad2a
+--- /dev/null
++++ b/tests/test_district_match_unit.py
+@@ -0,0 +1,271 @@
++# -*- coding: utf-8 -*-
++"""纯算法层单测：不依赖 Flask / models / 数据库（FakeRepo）。
++
++对应 PORTING_GUIDE 12.2 的算法类用例（#1–#13）与若干边界。
++运行：
++    python -m pytest tests/test_district_match_unit.py -q
++"""
++import pytest
++
++from services.district_match import address_parser, engine1, engine2, runner
++from services.district_match import constants
++from services.district_match.decider import dual_engine_decide
++from services.district_match.models import Engine1Result
++
++
++def _row(code, name, level, parent=""):
++    return {
++        "district_code": code, "district_name": name, "admin_level": level,
++        "parent_code": parent or None, "province_code": None, "city_code": None,
++        "id": code, "pid": parent or None,
++    }
++
++
++FIXTURE_ROWS = [
++    _row("110000000000", "北京市", 1),
++    _row("110100000000", "市辖区", 2, "110000000000"),
++    _row("110101000000", "东城区", 3, "110100000000"),
++    _row("110108000000", "海淀区", 3, "110100000000"),
++    _row("110101001000", "东华门街道", 4, "110101000000"),
++    _row("120000000000", "天津市", 1),
++    _row("150000000000", "内蒙古自治区", 1),
++    _row("150700000000", "呼伦贝尔市", 2, "150000000000"),
++    _row("150722000000", "莫力达瓦达斡尔族自治旗", 3, "150700000000"),
++    _row("150722001000", "红彦镇", 4, "150722000000"),
++    _row("150722001001", "新多村", 5, "150722001000"),
++    _row("230000000000", "黑龙江省", 1),
++    _row("230100000000", "哈尔滨市", 2, "230000000000"),
++    _row("230104000000", "道外区", 3, "230100000000"),
++    _row("230109000000", "松北区", 3, "230100000000"),
++    _row("230104001000", "水泥路街道", 4, "230104000000"),
++    _row("230104001001", "水泥路社区", 5, "230104001000"),
++    _row("231100000000", "黑河市", 2, "230000000000"),
++    _row("231183000000", "嫩江市", 3, "231100000000"),
++    _row("232700000000", "大兴安岭地区", 2, "230000000000"),
++    _row("232701000000", "漠河市", 3, "232700000000"),
++    _row("310000000000", "上海市", 1),
++    _row("310100000000", "市辖区", 2, "310000000000"),
++    _row("310151000000", "崇明区", 3, "310100000000"),
++    _row("500000000000", "重庆市", 1),
++    _row("500100000000", "市辖区", 2, "500000000000"),
++    _row("500120000000", "璧山区", 3, "500100000000"),
++    _row("640000000000", "宁夏回族自治区", 1),
++    _row("640400000000", "固原市", 2, "640000000000"),
++    _row("640425000000", "彭阳县", 3, "640400000000"),
++]
++
++HISTORY_ALIAS = {"太平区": "道外区"}
++HISTORY_CODE = {"230105": "230104"}
++
++
++class FakeRepo:
++    """只实现引擎依赖的 6 个方法。"""
++
++    def __init__(self, rows=None):
++        self.rows = rows if rows is not None else FIXTURE_ROWS
++        self.by_code = {r["district_code"]: r for r in self.rows}
++        self.by_name = {}
++        for r in self.rows:
++            self.by_name.setdefault((r["district_name"], r["admin_level"]), []).append(r)
++
++    def get_by_district_code(self, code, level=None):
++        row = self.by_code.get(code)
++        if row is None:
++            return None
++        if level is not None and row["admin_level"] != level:
++            return None
++        return row
++
++    def get_by_id(self, rid):
++        if rid is None:
++            return None
++        return self.by_code.get(str(rid))
++
++    def reverse_lookup(self, name, level, pid=None):
++        items = self.by_name.get((name, level)) or []
++        if pid:
++            for item in items:
++                if item.get("parent_code") == str(pid):
++                    return item
++            return None
++        return items[0] if items else None
++
++    def search_by_name(self, name, level=None):
++        if level is None:
++            return [r for r in self.rows if r["district_name"] == name]
++        return list(self.by_name.get((name, level)) or [])
++
++    def get_history_alias_map(self):
++        return dict(HISTORY_ALIAS)
++
++    def get_history_code_map(self):
++        return dict(HISTORY_CODE)
++
++
++@pytest.fixture()
++def repo():
++    return FakeRepo()
++
++
++def _match(repo, id_card, address):
++    return runner.run_match(repo, id_card, address, with_detail=True)
++
++
++# ---------------------------------------------------------------- 12.2 #1–#13
++def test_case01_history_code_plus_address(repo):
++    r = _match(repo, "230105199001010011",
++               "黑龙江省哈尔滨市道外区水泥路99-4号")
++    assert r.match_status == constants.STATUS_CORRECT
++    assert (r.province_name, r.city_name, r.district_name) == ("黑龙江省", "哈尔滨市", "道外区")
++    assert r.district_code == "230104000000"
++    assert "历史映射" in r.engine1_detail
++
++
++def test_case02_address_without_province(repo):
++    r = _match(repo, "230105199001010011", "哈尔滨市道外区水泥路99-4号")
++    assert r.match_status == constants.STATUS_CORRECT
++    assert r.district_code == "230104000000"
++    assert r.province_name == "黑龙江省"
++
++
++def test_case03_id_only(repo):
++    r = _match(repo, "230105", "")
++    assert r.match_status == constants.STATUS_PARSED_ID_ONLY
++    assert r.district_code == "230104000000"
++    assert r.district_name == "道外区"
++
++
++def test_case04_address_only(repo):
++    r = _match(repo, "", "黑龙江省哈尔滨市道外区水泥路99-4号")
++    assert r.match_status == constants.STATUS_PARSED
++    assert r.district_code == "230104000000"
++
++
++def test_case05_municipality(repo):
++    r = _match(repo, "", "北京市海淀区中关村大街1号")
++    assert r.match_status == constants.STATUS_PARSED
++    assert r.district_code == "110108000000"
++    assert r.city_name == "北京市"
++    assert r.city_code == "110000000000"
++
++
++def test_case06_invalid_id_only(repo):
++    r = _match(repo, "abc123", "")
++    assert r.match_status == constants.STATUS_ERROR
++
++
++def test_case07_invalid_id_valid_address(repo):
++    r = _match(repo, "abc123", "黑龙江省哈尔滨市道外区水泥路99-4号")
++    assert r.match_status == constants.STATUS_PARSED
++    assert r.district_code == "230104000000"
++
++
++def test_case08_both_empty(repo):
++    r = _match(repo, "", "")
++    assert r.match_status == constants.STATUS_ERROR
++    assert "未输入" in r.decision_path
++
++
++def test_case09_conflict_needs_review(repo):
++    r = _match(repo, "150722199001010011", "黑龙江省嫩江市中央街1号")
++    assert r.match_status == constants.STATUS_REVIEW
++    assert (r.province_name, r.city_name, r.district_name) == ("黑龙江省", "黑河市", "嫩江市")
++    assert r.district_code == "231183000000"
++
++
++def test_case10_autonomous_region_short_name(repo):
++    r = _match(repo, "640425199001010011", "宁夏彭阳县白阳镇1号")
++    assert r.match_status == constants.STATUS_CORRECT
++    assert r.district_code == "640425000000"
++    assert r.province_name == "宁夏回族自治区"
++
++
++def test_case11_county_level_city(repo):
++    r = _match(repo, "", "黑龙江省黑河市嫩江市中央街1号")
++    assert r.city_name == "黑河市"
++    assert r.district_name == "嫩江市"
++    assert r.district_code == "231183000000"
++
++
++def test_case12_community_not_county(repo):
++    parsed = address_parser.parse_address("黑龙江省哈尔滨市道外区水泥路社区1号")
++    assert parsed["district"] == "道外区"
++    r = _match(repo, "", "黑龙江省哈尔滨市道外区水泥路社区1号")
++    assert r.district_code == "230104000000"
++
++
++def test_case13_township_village(repo):
++    address = "莫力达瓦达斡尔族自治旗红彦镇新多村"
++    parsed = address_parser.parse_address(address)
++    assert parsed["district"] == "莫力达瓦达斡尔族自治旗"
++    assert parsed["township"] == "红彦镇"
++    assert parsed["village"] == "新多村"
++    r = _match(repo, "", address)
++    assert r.district_code == "150722000000"
++    assert r.city_name == "呼伦贝尔市"
++
++
++# ---------------------------------------------------------------- 其他边界
++def test_township_fallback_to_county():
++    """区县名缺失时，用乡镇反推区县（层级4兜底）。"""
++    rows = list(FIXTURE_ROWS)
++    repo = FakeRepo(rows)
++    r = _match(repo, "", "黑龙江省哈尔滨市水泥路街道1号")
++    # 地址中没有区县名，乡镇“水泥路街道”在哈尔滨市范围内反推 230104
++    assert r.district_code == "230104000000"
++
++
++def test_village_fallback_to_county(repo):
++    r = _match(repo, "", "黑龙江省哈尔滨市新多村")
++    # 新多村属内蒙古，黑龙江省范围内找不到 -> 不应跨省误配
++    assert r.district_code in (None, "")
++
++
++def test_municipality_virtual_shixiaqu(repo):
++    r = _match(repo, "110108199001010011", "")
++    assert r.match_status == constants.STATUS_PARSED_ID_ONLY
++    assert r.district_code == "110108000000"
++    assert r.city_name == "北京市"
++
++
++def test_history_alias_priority():
++    """同名历史区划优先按别名命中，避免误配到外地同名区。"""
++    rows = list(FIXTURE_ROWS) + [
++        _row("210911000000", "太平区", 3, "210900000000"),
++        _row("210900000000", "阜新市", 2, "210000000000"),
++        _row("210000000000", "辽宁省", 1),
++    ]
++    repo = FakeRepo(rows)
++    r = _match(repo, "", "哈尔滨市太平区1号")
++    assert r.district_code == "230104000000"
++
++
++def test_id_card_checksum_not_enforced(repo):
++    """只取前 6 位，不做校验位强校验。"""
++    r = _match(repo, "230104000000000000", "")
++    assert r.district_code == "230104000000"
++
++
++def test_engine1_invalid_first6(repo):
++    e1 = engine1.engine1_match(repo, "abc")
++    assert e1.error
++    assert isinstance(e1, Engine1Result)
++
++
++def test_engine2_no_address(repo):
++    assert engine2.engine2_parse(repo, "", None) is not None
++    r = _match(repo, "", "完全无法识别的文本")
++    assert r.match_status in (constants.STATUS_ERROR, constants.STATUS_NOMATCH,
++                              constants.STATUS_PARTIAL)
++
++
++def test_decider_with_empty_engines():
++    # 两引擎皆空时由 runner 提前判定「异常」；decider 层对应引擎① error 分支
++    res = dual_engine_decide(
++        FakeRepo(), Engine1Result(error="未输入有效的身份证/区划代码或地址"), None)
++    assert res.match_status == constants.STATUS_ERROR
++
++
++def test_all_status_values():
++    assert set(constants.ALL_STATUSES) == {
++        "正确", "已解析", "已解析(仅证件)", "需复核", "部分", "无匹配", "异常"}
+diff --git a/tests/test_routes.py b/tests/test_routes.py
+index 9d70c41..7b987b5 100644
+--- a/tests/test_routes.py
++++ b/tests/test_routes.py
+@@ -50,10 +50,10 @@ class TestBlueprintRegistration:
+         assert expected.issubset(endpoints)
+ 
+     def test_route_count(self, app):
+-        """路由总数约 148（144 Blueprint + 4 app.py）。"""
++        """路由总数约 163（148 原有 + 15 区划匹配）。"""
+         from app import app as flask_app
+         count = len(list(flask_app.url_map.iter_rules()))
+-        assert 145 <= count <= 155
++        assert 155 <= count <= 170
+ 
+ 
+ class TestModelsPackageImport:

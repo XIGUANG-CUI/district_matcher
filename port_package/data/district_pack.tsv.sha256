@@ -1,0 +1,5 @@
+# district_pack.tsv.gz 校验信息（由 scripts/build_district_pack.py 生成）
+sha256  d1e60bbb0141da282410c618aefecddcb9d8962ab647c7b5ffabbac8451c05f4
+size    5411508
+total   664239
+levels  1:31 2:343 3:3255 4:41274 5:619336
